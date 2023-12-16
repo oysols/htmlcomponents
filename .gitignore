@@ -1,0 +1,4 @@
+.*
+_*
+*.egg-info
+__pycache__

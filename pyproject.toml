@@ -1,0 +1,10 @@
+[project]
+name = "htmlcomponents"
+version = "0.1.0"
+description = ""
+dependencies = []
+optional-dependencies.dev = [
+    "mypy",
+    "black",
+    "ruff",
+]
