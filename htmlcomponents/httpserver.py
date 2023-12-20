@@ -362,12 +362,12 @@ class App:
             print(f"wsgiref serving on {host}:{port}")
             httpd.serve_forever()
 
-    def serve_static(self, route: str, local_path: Path) -> None:
+    def serve_static_path(self, base_route: str, local_path: Path) -> None:
         resolved_local_path = local_path.resolve()
 
-        @self.get(f"{route.rstrip('/')}/<path>")
+        @self.get(f"/{base_route.rstrip('/')}/<path>")
         @cast_request
-        def static(request: Request, path_path: str) -> bytes:
+        def static_path(path_path: str) -> bytes:
             local_path = (resolved_local_path / Path(path_path)).resolve()
             assert local_path.relative_to(resolved_local_path)
             return local_path.read_bytes()
