@@ -10,7 +10,7 @@ class Component:
     """HTML Component base class for building HTML documents in Python
 
     `children` are html escaped
-        DangerouslySetInnerHTML can be used to bypass html escaping
+        NoEscape can be used to bypass html escaping
 
     `attrs` is NOT secure against injection attacks
         attrs with underscores '_' will be replaced with dashes '-'
@@ -83,11 +83,7 @@ class Component:
         if not self.children:
             return [first_line + f"</{name}>"]
         # Inline single string children
-        if (
-            len(self.children) == 1
-            and isinstance(self.children[0], str)
-            and not isinstance(self.children[0], DangerouslySetInnerHTML)
-        ):
+        if len(self.children) == 1 and isinstance(self.children[0], str) and not isinstance(self.children[0], NoEscape):
             return [first_line + escape(self.children[0]) + f"</{name}>"]
         lines = [first_line]
         lines += render_components(self.children, indent + 2)
@@ -98,8 +94,8 @@ class Component:
 def render_components(components: List[Component | str | None], indent: int = 0) -> List[str]:
     lines = []
     for component in components:
-        if isinstance(component, DangerouslySetInnerHTML):
-            lines += [" " * indent + component]
+        if isinstance(component, NoEscape):
+            lines += [component]
         elif isinstance(component, str):
             lines += [" " * indent + escape(component)]
         elif component is None:
@@ -111,7 +107,7 @@ def render_components(components: List[Component | str | None], indent: int = 0)
     return lines
 
 
-class DangerouslySetInnerHTML(str):
+class NoEscape(str):
     pass
 
 
