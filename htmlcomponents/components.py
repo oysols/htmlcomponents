@@ -92,7 +92,7 @@ class Component:
 
 
 def render_components(components: List[Component | str | None], indent: int = 0) -> List[str]:
-    lines = []
+    lines: List[str] = []
     for component in components:
         if isinstance(component, NoEscape):
             lines += [component]
