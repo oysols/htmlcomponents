@@ -378,14 +378,17 @@ class BufferedSocketReader:
         self.conn = conn
         self.buffer: bytes = b""
         self.max_buf_size = 10e6  # bytes
-        self.timeout = 30  # seconds
+        self.timeout = 5  # seconds
 
     def _recv_to_buf(self, size: int) -> None:
         r, _, _ = select.select([self.conn], [], [], self.timeout)
         if r:
-            self.buffer += self.conn.recv(size)
+            recv = self.conn.recv(size)
+            if recv == b"":
+                raise ConnectionResetError("Client closed connection")
+            self.buffer += recv
         else:
-            raise Exception(f"Read timeout {self.timeout}s")
+            raise TimeoutError(f"Read timeout {self.timeout}s")
         if len(self.buffer) > self.max_buf_size:
             raise Exception(f"Read buffer exceeds max size: {len(self.buffer)} > {self.max_buf_size}")
 
@@ -424,9 +427,11 @@ def http_server(handler: RequestHandler, host: str = "0.0.0.0", port: int = 8000
             body_iterable = iter([response.body]) if isinstance(response.body, bytes) else response.body
             for chunk in body_iterable:
                 if chunk == b"" and not is_connection_alive(conn):
-                    print("Connection closed by remote.")
-                    break
+                    # Endpoint can yield b"" to verify connection status
+                    raise ConnectionResetError("Connection closed by remote.")
                 conn.sendall(chunk)
+        except (ConnectionResetError, TimeoutError):
+            pass
         except Exception:
             traceback.print_exc()
         finally:
