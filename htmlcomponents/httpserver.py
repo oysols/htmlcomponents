@@ -434,6 +434,8 @@ def http_server(handler: RequestHandler, host: str = "0.0.0.0", port: int = 8000
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    # Disable Nagle's algorithm https://en.wikipedia.org/wiki/Nagle's_algorithm
+    sock.setsockopt(socket.SOL_TCP, socket.TCP_NODELAY, 1)
     server_address = (host, port)
     sock.bind(server_address)
     sock.listen(10)
