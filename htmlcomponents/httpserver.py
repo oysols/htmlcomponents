@@ -195,11 +195,11 @@ class Request:
             conn,
         )
 
-    def get_session(self) -> Dict[Any, Any] | None:
+    def get_session(self) -> Dict[Any, Any]:
         # Parse session cookie
         # https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Cookie
         # Cookie: name=value; name2=value2; name3=value3
-        session = None
+        session = {}
         for cookie in self.headers.get("Cookie", "").split(";"):
             try:
                 name, data = cookie.strip().split("=")
@@ -254,11 +254,11 @@ class Response:
         if set_session is not None:
             serialized_data = serialize_with_hmac(COOKIE_HMAC_SECRET, set_session)
             if set_session == {}:
-                cookie = {"Set-Cookie": "session=; Max-Age=0"}
+                cookie = {"Set-Cookie": "session=; Max-Age=0; Path=/"}
             elif SECURE_COOKIES:
-                cookie = {"Set-Cookie": f"session={serialized_data}; Secure; HttpOnly; SameSite=Lax"}
+                cookie = {"Set-Cookie": f"session={serialized_data}; Secure; HttpOnly; SameSite=Lax; Path=/"}
             else:
-                cookie = {"Set-Cookie": f"session={serialized_data}; HttpOnly; SameSite=Lax"}
+                cookie = {"Set-Cookie": f"session={serialized_data}; HttpOnly; SameSite=Lax; Path=/"}
             self.headers.update(cookie)
 
     @staticmethod
