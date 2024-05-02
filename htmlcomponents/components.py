@@ -264,12 +264,13 @@ class html:
 def html_doc_template(*body: Component | str | None) -> Component:
     """Simple html document example"""
     return html.doctype(
-        html.html(
+        html.html(lang="en")(
             html.head(
                 html.title(),
                 html.meta(charset="utf-8"),
+                html.meta(name="viewport", content="width=device-width, initial-scale=1.0"),
                 html.link(rel="icon", href="noop://"),
-                html.style("*{box-sizing: border-box;} body{margin: 0; padding: 0;}"),
+                html.style("*{box-sizing: border-box;} body{margin: 0; padding: 0;} h1,h2,h3,h4,h5,h6{margin-top:0}"),
             ),
             html.body(*body),
         )
