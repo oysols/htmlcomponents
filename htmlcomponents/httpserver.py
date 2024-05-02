@@ -214,7 +214,7 @@ class Request:
         return dict(urllib.parse.parse_qsl(self.body.decode(), keep_blank_values=True))
 
     def json(self) -> Dict[str, Any]:
-        return json.loads(self.body.decode())
+        return json.loads(self.body.decode())  # type: ignore
 
     def print(self) -> None:
         print(self)
@@ -352,7 +352,7 @@ class App:
     def run(self, host: str = "0.0.0.0", port: int = 8000) -> None:
         http_server(self.handle, host, port)
 
-    def to_wsgi(self):
+    def to_wsgi(self) -> WSGIWrapper:
         return WSGIWrapper(self.handle)
 
     def run_wsgiref(self, host: str = "0.0.0.0", port: int = 8000) -> None:
@@ -491,7 +491,7 @@ def validate_and_cast_to_type(
     if isinstance(data, data_type):
         return data
     if data_type == Any:
-        return data
+        return data  # type: ignore
     # Catch options to pass down recursively
     arguments = locals().copy()
     arguments.pop("data_type")
