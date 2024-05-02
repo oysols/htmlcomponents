@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from html import escape
-from typing import Dict, List, Self
+from typing import Dict, List, Self, Union
+
+Node = Union["Component", str, None, list["Node"]]
 
 
 @dataclass
@@ -30,7 +32,7 @@ class Component:
     '<p id="mytext" style="color: red">Hello World!</p>'
     """
 
-    children: List[Component | str | None]
+    children: list[Node]
     style: Dict[str, str]
     attrs: Dict[str, str | None]
 
@@ -44,7 +46,7 @@ class Component:
         self.attrs = attrs.copy()
         self.style = style.copy()
 
-    def __call__(self, *children: Component | str | None) -> Self:
+    def __call__(self, *children: Node) -> Self:
         if self.children:
             raise Exception("Component allready has children")
         self.children = list(children)
@@ -86,25 +88,27 @@ class Component:
         if len(self.children) == 1 and isinstance(self.children[0], str) and not isinstance(self.children[0], NoEscape):
             return [first_line + escape(self.children[0]) + f"</{name}>"]
         lines = [first_line]
-        lines += render_components(self.children, indent + 2)
+        lines += render_node(self.children, indent + 2)
         lines += [" " * indent + f"</{name}>"]
         return lines
 
 
-def render_components(components: List[Component | str | None], indent: int = 0) -> List[str]:
-    lines: List[str] = []
-    for component in components:
-        if isinstance(component, NoEscape):
-            lines += [component]
-        elif isinstance(component, str):
-            lines += [" " * indent + escape(component)]
-        elif component is None:
-            continue
-        elif isinstance(component, Component):
-            lines += component.render_component(indent)
-        else:
-            raise Exception(f"Cannot render unexpected type: {type(component)}")
-    return lines
+def render_node(node: Node, indent: int = 0) -> List[str]:
+    if isinstance(node, list):
+        lines = []
+        for sub_node in node:
+            lines += render_node(sub_node, indent)
+        return lines
+    elif isinstance(node, NoEscape):
+        return [node]
+    elif isinstance(node, str):
+        return [" " * indent + escape(node)]
+    elif node is None:
+        return []
+    elif isinstance(node, Component):
+        return node.render_component(indent)
+    else:
+        raise Exception(f"Cannot render unexpected type: {type(node)}")
 
 
 class NoEscape(str):
@@ -244,7 +248,7 @@ class html:
     # Custom handling for special doctype component
     class doctype(Component):
         def render_component(self, indent: int = 0) -> List[str]:
-            return ["<!DOCTYPE html>"] + render_components(self.children, indent)
+            return ["<!DOCTYPE html>"] + render_node(self.children, indent)
 
     # Svg subset
     class svg(Component): pass
