@@ -10,6 +10,7 @@ import hashlib
 import hmac
 import http.server
 import json
+import mimetypes
 import secrets
 import select
 import socket
@@ -91,6 +92,22 @@ def deserialize_and_verify_hmac(key: bytes, serialized_data: str) -> Any:
     if not hmac.compare_digest(data_hmac_hex, client_specifiec_hmac_hex):
         raise Exception("HMAC verification failed")
     return json.loads(data_bytes.decode())
+
+
+def file_content_iterator(
+    file: Path, chunk_size: int, from_offset: int = 0, to_offset: int | None = None
+) -> Iterator[bytes]:
+    with file.open("rb") as f:
+        f.seek(from_offset)
+        while True:
+            pos = f.tell()
+            if to_offset and (pos + chunk_size) >= to_offset:
+                yield f.read(to_offset - pos)
+                return
+            data = f.read(chunk_size)
+            if data == b"":
+                return
+            yield data
 
 
 def is_connection_alive(conn: socket.socket) -> bool:
@@ -362,15 +379,48 @@ class App:
             print(f"wsgiref serving on {host}:{port}")
             httpd.serve_forever()
 
-    def serve_static_path(self, base_route: str, local_path: Path) -> None:
+    def serve_static_path(self, base_route: str, local_path: Path, guess_content_type: bool = True) -> None:
+        CHUNK_SIZE = 1024 * 1024
         resolved_local_path = local_path.resolve()
 
-        @self.get(f"/{base_route.rstrip('/')}/<path>")
+        @self.get(f"/{base_route.strip('/')}/<path>")
         @cast_request
-        def static_path(path_path: str) -> bytes:
+        def static_path(path_path: str, header_range: str | None) -> Response:
             local_path = (resolved_local_path / Path(path_path)).resolve()
             assert local_path.relative_to(resolved_local_path)
-            return local_path.read_bytes()
+            if not local_path.is_file():
+                return self.default_route()
+            file_size = local_path.stat().st_size
+            content_type = "application/octet-stream"
+            if guess_content_type:
+                content_type = mimetypes.guess_type(local_path)[0] or content_type
+            # Support Content-Range to allow remote seeking in files
+            if header_range:
+                try:
+                    bytestring, rangestring = header_range.split("=")
+                    if bytestring != "bytes":
+                        raise TypeError("Unsupported range type")
+                    startstring, endstring = rangestring.split("-")
+                    start = int(startstring)
+                    inclusive_end = int(endstring) if endstring else file_size - 1
+                    if start < 0 or start >= file_size or inclusive_end < start or inclusive_end >= file_size:
+                        raise ValueError("Invalid byte range")
+                except Exception as e:
+                    return Response(f"Invalid Range request: {e}", 400)
+                return Response(
+                    file_content_iterator(local_path, CHUNK_SIZE, start, inclusive_end + 1),
+                    206,
+                    {
+                        "Accept-Ranges": "bytes",
+                        "Content-Range": f"bytes {start}-{inclusive_end}/{file_size}",
+                        "Content-Type": content_type,
+                    },
+                )
+            return Response(
+                file_content_iterator(local_path, CHUNK_SIZE),
+                200,
+                {"Accept-Ranges": "bytes", "Content-Type": content_type, "Content-Length": str(file_size)},
+            )
 
 
 class BufferedSocketReader:
@@ -430,7 +480,7 @@ def http_server(handler: RequestHandler, host: str = "0.0.0.0", port: int = 8000
                     # Endpoint can yield b"" to verify connection status
                     raise ConnectionResetError("Connection closed by remote.")
                 conn.sendall(chunk)
-        except (ConnectionResetError, TimeoutError):
+        except (ConnectionResetError, TimeoutError, BrokenPipeError):
             pass
         except Exception:
             traceback.print_exc()
