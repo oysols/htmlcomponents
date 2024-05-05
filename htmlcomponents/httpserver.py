@@ -699,6 +699,17 @@ def cast_request(route_function: Callable[..., RouteFunctionResponse]) -> RouteF
     return decorator
 
 
+def main() -> None:
+    """usage: `httpserver [PORT]`"""
+    import sys
+
+    port = int(sys.argv[1]) if len(sys.argv) == 2 else 8000
+
+    app = App()
+    app.serve_static_path("", Path("."))
+    app.run(port=port)
+
+
 if __name__ == "__main__":
     app = App()
 

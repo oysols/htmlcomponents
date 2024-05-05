@@ -8,3 +8,6 @@ optional-dependencies.dev = [
     "black",
     "ruff",
 ]
+
+[project.scripts]
+httpserver = "htmlcomponents:httpserver.main"
