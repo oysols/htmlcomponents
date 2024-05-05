@@ -295,10 +295,10 @@ class Response:
             components = []
             for item in body:
                 if not isinstance(item, HTMLRenderable):
-                    raise TypeError(f"Unsupported cast from list of {type(item)} to bytes.")
+                    raise TypeError(f"Unsupported cast from list of {type(item).__name__} to bytes.")
                 components.append(item.render_html().encode())
             return b"\n".join(components), ContentType.text_html
-        raise TypeError(f"Unsupported cast from {type(body)} to bytes.")
+        raise TypeError(f"Unsupported cast from {type(body).__name__} to bytes.")
 
 
 BodyResponse = bytes | str | Dict[str, Any] | HTMLRenderable | Sequence[HTMLRenderable] | Iterator[bytes]
@@ -555,7 +555,7 @@ def validate_and_cast_to_type(
     arguments.pop("data")
     options = arguments
     if not isinstance(data_type, (typing._GenericAlias, typing.GenericAlias, type, UnionType)):  # type: ignore
-        raise TypeError(f"{data_type} type:{type(data_type)} is not a type")
+        raise TypeError(f"{data_type} type:{type(data_type).__name__} is not a type")
     # Basic types
     simple_types = [int, float, str, bool, bytes]
     if data_type in simple_types:
@@ -563,14 +563,14 @@ def validate_and_cast_to_type(
             return float(data)  # type: ignore
         if cast_str_to_int_and_float and isinstance(data, str) and data_type in [int, float]:
             return data_type(data)  # type: ignore
-        raise TypeError(f"Expected {data_type}, got '{type(data)}'")
+        raise TypeError(f"Expected {data_type}, got '{type(data).__name__}'")
     # Dataclasses
     if dataclasses.is_dataclass(data_type):
         if dataclasses.is_dataclass(data):
-            raise TypeError(f"Expected {data_type}, got '{type(data)}'")
+            raise TypeError(f"Expected {data_type}, got '{type(data).__name__}'")
         elif cast_dict_to_dataclass:
             if not isinstance(data, dict):
-                raise TypeError(f"Expected dict when casting to {data_type}, got '{type(data)}'")
+                raise TypeError(f"Expected dict when casting to {data_type}, got '{type(data).__name__}'")
         else:
             raise TypeError("Casting to dataclass not allowed.")
         fieldtypes = typing.get_type_hints(data_type)
@@ -604,7 +604,7 @@ def validate_and_cast_to_type(
                 return validate_and_cast_to_type(data, subtype, *options)  # type: ignore
             except TypeError:
                 pass
-        raise TypeError(f"Expected union data type {data_type}, but got {type(data)}")
+        raise TypeError(f"Expected union data type {data_type}, but got {type(data).__name__}")
     # Unsupported datatype
     if force_cast_unsupported_datatype:
         return data_type(data)  # type: ignore
