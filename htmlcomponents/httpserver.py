@@ -379,11 +379,14 @@ class App:
             print(f"wsgiref serving on {host}:{port}")
             httpd.serve_forever()
 
-    def serve_static_path(self, base_route: str, local_path: Path, guess_content_type: bool = True) -> None:
+    def serve_static_path(
+        self, base_route: str, local_path: Path, guess_content_type: bool = True, cache_control: int | None = None
+    ) -> None:
         CHUNK_SIZE = 1024 * 1024
         resolved_local_path = local_path.resolve()
+        route = str(Path("/") / base_route.strip("/") / "<path>")
 
-        @self.get(f"/{base_route.strip('/')}/<path>")
+        @self.get(route)
         @cast_request
         def static_path(path_path: str, header_range: str | None) -> Response:
             local_path = (resolved_local_path / Path(path_path)).resolve()
@@ -394,6 +397,12 @@ class App:
             content_type = "application/octet-stream"
             if guess_content_type:
                 content_type = mimetypes.guess_type(local_path)[0] or content_type
+            headers = {
+                "Accept-Ranges": "bytes",
+                "Content-Type": content_type,
+            }
+            if cache_control is not None:
+                headers |= {"Cache-Control": f"private,max-age={cache_control}"}
             # Support Content-Range to allow remote seeking in files
             if header_range:
                 try:
@@ -410,16 +419,12 @@ class App:
                 return Response(
                     file_content_iterator(local_path, CHUNK_SIZE, start, inclusive_end + 1),
                     206,
-                    {
-                        "Accept-Ranges": "bytes",
-                        "Content-Range": f"bytes {start}-{inclusive_end}/{file_size}",
-                        "Content-Type": content_type,
-                    },
+                    headers | {"Content-Range": f"bytes {start}-{inclusive_end}/{file_size}"},
                 )
             return Response(
                 file_content_iterator(local_path, CHUNK_SIZE),
                 200,
-                {"Accept-Ranges": "bytes", "Content-Type": content_type, "Content-Length": str(file_size)},
+                headers | {"Content-Length": str(file_size)},
             )
 
 
