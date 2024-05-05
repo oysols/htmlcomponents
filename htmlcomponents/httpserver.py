@@ -632,6 +632,8 @@ def request_to_spec(
                 value = request.matched_route_mapping.get(path) if request.matched_route_mapping else None
             case ["param", param]:
                 value = request.query_params.get(param)
+            case ["session"]:
+                value = request.get_session()
             case arg:
                 raise Exception(f"Unexpected argument {'_'.join(arg)}")
         try:
@@ -672,6 +674,7 @@ def cast_request(route_function: Callable[..., RouteFunctionResponse]) -> RouteF
     header_<header_name>    Request.headers.get("<Header-Name>")
     path_<path_variable>    Request.matched_route_mapping.get("<path_variable>")
     param_<param_name>      Request.query_params.get("<param_name>")
+    session                 Request.get_session()
 
     Example:
     ```
