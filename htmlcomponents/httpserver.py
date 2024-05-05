@@ -640,7 +640,7 @@ def request_to_spec(
             pretty_type_name = (
                 annotation_type.__name__ if hasattr(annotation_type, "__name__") else str(annotation_type)
             )
-            validation_errors.append(f"{name}: Expected '{pretty_type_name}', but got '{value}'.")
+            validation_errors.append(f"{name}: expected '{pretty_type_name}'")
     if validation_errors:
         return None, validation_errors
     return validated_data, []
