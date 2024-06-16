@@ -463,7 +463,11 @@ class App:
                 return Response(
                     file_content_iterator(local_path, CHUNK_SIZE, start, inclusive_end + 1),
                     206,
-                    headers | {"Content-Range": f"bytes {start}-{inclusive_end}/{file_size}"},
+                    headers
+                    | {
+                        "Content-Range": f"bytes {start}-{inclusive_end}/{file_size}",
+                        "Content-Length": str(file_size - start),
+                    },
                 )
             return Response(
                 file_content_iterator(local_path, CHUNK_SIZE),
