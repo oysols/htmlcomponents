@@ -862,6 +862,69 @@ def main() -> None:
     app.run(port=port)
 
 
+def iterate_from_chunked_encoding(socket_reader: BufferedSocketReader) -> Iterator[bytes]:
+    while True:
+        buffer = b""
+        chunk = socket_reader.read_to_delimiter(b"\r\n")
+        length = int(chunk[:-2], 16)
+        buffer += chunk
+        if length == 0:
+            yield buffer
+            break
+        buffer += socket_reader.read(length)
+        buffer += socket_reader.read(len("\r\n"))
+        yield buffer
+    yield socket_reader.read(len("\r\n"))
+
+
+def iterate_from_content_length(socket_reader: BufferedSocketReader, content_length: int) -> Iterator[bytes]:
+    chunk = 1024 * 1024
+    remaining_bytes = content_length
+    while remaining_bytes > 0:
+        if remaining_bytes <= chunk:
+            yield socket_reader.read(remaining_bytes)
+            break
+        yield socket_reader.read(chunk)
+        remaining_bytes -= chunk
+
+
+def proxy_request(request: Request, host: str, port: int) -> Response:
+    # Connect to proxied host
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.connect((host, port))
+
+    # Add proxy headers
+    headers = request.headers.copy()
+    headers.set("X-Forwarded-For", request.remote_addr)
+
+    # Reassemble request HTTP headers
+    params = "&".join(
+        [urllib.parse.quote(k) + ("=" + urllib.parse.quote(v) if v else "") for k, v in request.query_params.items()]
+    )
+    data = f"{request.method.value} {request.path + ('?' + params if params else '')} HTTP/1.1\r\n"
+    for k, v in headers.raw_headers:
+        data += f"{k}: {v}\r\n"
+    data += "\r\n"
+
+    # Proxy the request
+    s.sendall(data.encode() + request.body)
+
+    # Parse proxied response headers
+    socket_reader = BufferedSocketReader(s, timeout=5)
+    header = socket_reader.read_to_delimiter(b"\r\n\r\n")
+    http_top_header, *http_headers = header.decode().split("\r\n")
+    _protocol, code, *_description = http_top_header.split()
+    headers = Headers.from_raw(http_headers)
+
+    # Proxy body response
+    if "chunked" in headers.get("Transfer-Encoding", ""):
+        stream = iterate_from_chunked_encoding(socket_reader)
+    else:
+        stream = iterate_from_content_length(socket_reader, int(headers.get("Content-Length", 0)))
+
+    return Response(stream, int(code), raw_headers=headers)
+
+
 if __name__ == "__main__":
     app = App()
 
