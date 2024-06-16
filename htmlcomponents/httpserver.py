@@ -36,6 +36,7 @@ from typing import (
     Type,
     TypeVar,
     Union,
+    overload,
     runtime_checkable,
 )
 
@@ -66,11 +67,7 @@ class Method(str, enum.Enum):
     options = "OPTIONS"
     trace = "TRACE"
     patch = "PATCH"
-
-
-def normalize_headers(headers: Dict[str, str]) -> Dict[str, str]:
-    # Always normalizing headers to avoid duplicates and key lookup issues
-    return {k.strip().title(): v.strip() for k, v in headers.items()}
+    # connect = "CONNECT"
 
 
 def serialize_with_hmac(key: bytes, data: Any) -> str:
@@ -145,13 +142,65 @@ def match_path(pattern: str, path: str) -> Dict[str, str] | None:
     return parsed
 
 
+T = TypeVar("T")
+
+
+@dataclass
+class Headers:
+    # Cannot use a simple dictionary for headers since we might receive duplicates
+    # Mostly a problem with multiple Set-Cookie in proxy mode
+    # https://www.rfc-editor.org/rfc/rfc7230
+    # > recipients ought to handle "Set-Cookie" as a special case while processing header fields.
+    raw_headers: list[tuple[str, str]]
+
+    @staticmethod
+    def from_raw(http_headers: list[str]) -> Headers:
+        return Headers([(k.strip(), v.strip()) for k, v in [header.split(":", 1) for header in http_headers if header]])
+
+    @overload
+    def get(self, key: str) -> None | str:
+        ...
+
+    @overload
+    def get(self, key: str, default: T) -> T | str:
+        ...
+
+    def get(self, key, default=None):
+        for k, v in self.raw_headers:
+            if k.lower() == key.lower():
+                return v
+        return default
+
+    def set(self, key: str, value: str) -> None:
+        has_set = False
+        new_raw_headers = []
+        for k, v in self.raw_headers:
+            if k.lower() == key.lower():
+                if has_set:
+                    continue
+                new_raw_headers.append((key, value))
+                has_set = True
+            else:
+                new_raw_headers.append((k, v))
+        else:
+            if not has_set:
+                new_raw_headers.append((key, value))
+        self.raw_headers = new_raw_headers
+
+    def copy(self) -> Headers:
+        return Headers(self.raw_headers.copy())
+
+    def to_dict(self) -> dict[str, str]:
+        return {k: v for k, v in self.raw_headers}
+
+
 @dataclass
 class Request:
     remote_addr: str
     method: Method
     path: str
     query_params: Dict[str, str]
-    headers: Dict[str, str]
+    headers: Headers
     content_length: int
     body: bytes
     request_start: float
@@ -168,7 +217,8 @@ class Request:
         path = environ["PATH_INFO"]
         query_params = dict(urllib.parse.parse_qsl(environ["QUERY_STRING"]))
         # WSGI request headers are prefixed with HTTP_
-        headers = normalize_headers({k[5:].replace("_", "-"): v for k, v in environ.items() if k.startswith("HTTP_")})
+        raw_headers = [(k[5:].replace("_", "-"), v) for k, v in environ.items() if k.startswith("HTTP_")]
+        headers = Headers(raw_headers)
         remote_addr = environ["REMOTE_ADDR"]
         # Read body if content_length
         content_length = int(environ["CONTENT_LENGTH"]) if environ["CONTENT_LENGTH"] else 0
@@ -193,13 +243,13 @@ class Request:
         raw_method, url, _protocol = http_code_header.split()
         method = Method(raw_method)
         path, *query_string = url.split("?", 1)
-        query_params = dict(urllib.parse.parse_qsl(query_string[0])) if query_string else {}
-        headers = normalize_headers({k: v for k, v in [header.split(":", 1) for header in http_headers if header]})
+        query_params = dict(urllib.parse.parse_qsl(query_string[0], keep_blank_values=True)) if query_string else {}
+        headers = Headers.from_raw(http_headers)
         # Read body if content_length
         content_length = int(headers.get("Content-Length", 0))
         body = body_byte_stream.read(content_length) if content_length else b""
         return Request(
-            remote_addr,
+            headers.get("X-Forwarded-For") or remote_addr,  # TODO: Security
             method,
             path,
             query_params,
@@ -250,7 +300,7 @@ class Request:
 class Response:
     body: bytes | Iterator[bytes]
     code: int
-    headers: Dict[str, str]
+    headers: Headers
 
     def __repr__(self) -> str:
         return f"Response<{self.code}>"
@@ -261,22 +311,34 @@ class Response:
         code: int = 200,
         headers: Dict[str, str] | None = None,
         set_session: Dict[str, str] | None = None,
+        raw_headers: Headers | None = None,
     ) -> None:
+        if raw_headers:
+            assert isinstance(body, (bytes, Iterator))
+            self.body = body
+            self.code = code
+            assert headers is None
+            assert set_session is None
+            self.headers = raw_headers
+            return
         self.body, content_type = self.cast_body_response(body)
-        self.headers = normalize_headers({"Content-Type": content_type})
-        if isinstance(self.body, bytes):
-            self.headers |= normalize_headers({"Content-Length": str(len(self.body))})
-        self.headers |= normalize_headers(headers) if headers else {}
         self.code = code
+        self.headers = Headers([])
+        self.headers.set("Content-Type", content_type)
+        if isinstance(self.body, bytes):
+            self.headers.set("Content-Length", str(len(self.body)))
         if set_session is not None:
             serialized_data = serialize_with_hmac(COOKIE_HMAC_SECRET, set_session)
             if set_session == {}:
-                cookie = {"Set-Cookie": "session=; Max-Age=0; Path=/"}
+                cookie = "session=; Max-Age=0; Path=/"
             elif SECURE_COOKIES:
-                cookie = {"Set-Cookie": f"session={serialized_data}; Secure; HttpOnly; SameSite=Lax; Path=/"}
+                cookie = f"session={serialized_data}; Secure; HttpOnly; SameSite=Lax; Path=/"
             else:
-                cookie = {"Set-Cookie": f"session={serialized_data}; HttpOnly; SameSite=Lax; Path=/"}
-            self.headers.update(cookie)
+                cookie = f"session={serialized_data}; HttpOnly; SameSite=Lax; Path=/"
+            self.headers.set("Set-Cookie", cookie)
+        if headers:
+            for k, v in headers.items():
+                self.headers.set(k, v)
 
     @staticmethod
     def cast_body_response(body: BodyResponse) -> Tuple[bytes | Iterator[bytes], str]:
@@ -339,10 +401,11 @@ class App:
         if isinstance(response.body, bytes) and "gzip" in [
             encoding.strip() for encoding in request.headers.get("Accept-Encoding", "").split(",")
         ]:
+            if response.headers.get("Content-Encoding"):
+                return
             response.body = gzip.compress(response.body)
-            response.headers.update(
-                normalize_headers({"Content-Encoding": "gzip", "Content-Length": str(len(response.body))})
-            )
+            response.headers.set("Content-Encoding", "gzip")
+            response.headers.set("Content-Length", str(len(response.body)))
 
     def handle(self, request: Request) -> Response:
         # Get route
@@ -474,10 +537,12 @@ def http_server(handler: RequestHandler, host: str = "0.0.0.0", port: int = 8000
             except Exception:
                 traceback.print_exc()
                 response = Response("Internal Server Error", 500)
-            response.headers["Server"] = "httpserver.py"
+            request_handler_duration = time.time() - request.request_start
+            response.headers.set("Server", "httpserver.py")
+            response.headers.set("Connection", "keep-alive" if keep_alive else "close")
             phrase, _ = http.server.BaseHTTPRequestHandler.responses[response.code]
             conn.sendall(f"HTTP/1.1 {response.code} {phrase}\r\n".encode())
-            conn.sendall(b"\r\n".join([f"{k}: {v}".encode() for k, v in response.headers.items()]))
+            conn.sendall(b"\r\n".join([f"{k}: {v}".encode() for k, v in response.headers.raw_headers]))
             conn.sendall(b"\r\n\r\n")
             body_iterable = iter([response.body]) if isinstance(response.body, bytes) else response.body
             for chunk in body_iterable:
@@ -529,7 +594,7 @@ class WSGIWrapper:
         response = self.handler(request)
 
         phrase, _ = http.server.BaseHTTPRequestHandler.responses[response.code]
-        start_response(f"{response.code} {phrase}", [(k, v) for k, v in response.headers.items()])
+        start_response(f"{response.code} {phrase}", [(k, v) for k, v in response.headers.raw_headers])
         if isinstance(response.body, bytes):
             yield response.body
         else:
@@ -537,9 +602,6 @@ class WSGIWrapper:
 
 
 # Endpoint argument parsing
-
-
-T = TypeVar("T")
 
 
 def validate_and_cast_to_type(
@@ -721,6 +783,7 @@ if __name__ == "__main__":
     def index(request: Request) -> Response:
         request._conn = None  # To make it work with .asdict
         data = dataclasses.asdict(request)
+        data["headers"] = request.headers.to_dict()
         data["body"] = data["body"].decode()  # To make it work with json.dumps
         data["clear_text_session"] = request.get_session()
         return Response(data, 200, set_session={"secret": "cookiestuff3"})
