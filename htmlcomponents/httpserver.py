@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import binascii
 import concurrent.futures
+import contextlib
 import dataclasses
 import enum
 import functools
@@ -12,8 +13,8 @@ import http.server
 import json
 import mimetypes
 import secrets
-import select
 import socket
+import ssl
 import textwrap
 import time
 import traceback
@@ -405,9 +406,6 @@ class App:
         response = route_response if isinstance(route_response, Response) else Response(route_response)
         # Post processing
         self.gzip_middleware(request, response)
-        # Logging
-        duration = time.time() - request.request_start
-        print(request.remote_addr, response.code, request.method.value, request.path, f"{duration * 1000:.2f}ms")
         return response
 
     def run(self, host: str = "0.0.0.0", port: int = 8000) -> None:
@@ -524,12 +522,49 @@ class BufferedSocketReader:
 RequestHandler = Callable[[Request], Response]
 
 
-def http_server(handler: RequestHandler, host: str = "0.0.0.0", port: int = 8000, threads: int = 20) -> None:
-    def connection_handler(conn: socket.socket, client_address: str, handler: RequestHandler) -> None:
-        try:
-            socket_reader = BufferedSocketReader(conn)
+class WrappedSSLSocket(ssl.SSLSocket):
+    intercepted_sni_hostname: str | None = None
+
+
+def connection_handler(
+    conn: socket.socket | WrappedSSLSocket,
+    client_address: str,
+    handler: RequestHandler,
+    keep_alive: bool,
+    use_tls: bool,
+    debug: bool = False,
+) -> None:
+    reason_close = None
+    connection_start = time.time()
+    try:
+        request_start = time.time()
+        if debug:
+            print(f"{client_address[0]}:{client_address[1]} Connection opened")
+
+        # Perform SSL handshake inside thread to avoid blocking main loop
+        if use_tls:
+            assert isinstance(conn, WrappedSSLSocket)
+            conn.settimeout(5)
+            conn.do_handshake()
+
+        socket_reader = BufferedSocketReader(conn)
+        while True:  # Reuse connection if keep alive is set
             header = socket_reader.read_to_delimiter(b"\r\n\r\n")
             request = Request.from_raw(client_address[0], header, socket_reader, conn)  # type: ignore
+
+            # Validate that Host matches SNI
+            if use_tls:
+                assert isinstance(conn, WrappedSSLSocket)
+                host, *port = request.headers.get("Host", "").split(":")
+                if port:
+                    assert len(port) == 1
+                    assert int(port[0]) > 0
+                    assert int(port[0]) <= 65535
+                if host != conn.intercepted_sni_hostname:
+                    raise ssl.SSLError(
+                        f"Host header does not match SNI {request.headers.get('Host')} != {conn.intercepted_sni_hostname}"
+                    )
+
             try:
                 response = handler(request)
             except Exception:
@@ -552,31 +587,84 @@ def http_server(handler: RequestHandler, host: str = "0.0.0.0", port: int = 8000
                     # Endpoint can yield b"" to verify connection status
                     break
                 conn.sendall(chunk)
-        except (ConnectionResetError, TimeoutError, BrokenPipeError):
-            pass
-        except Exception:
-            traceback.print_exc()
-        finally:
-            conn.close()
 
+            # Logging
+            total_duration = time.time() - request_start
+            print(
+                f"{client_address[0]}:{client_address[1]}",
+                request.headers.get("Host"),
+                response.code,
+                request.method.value,
+                request.path,
+                f"{request_handler_duration * 1000:.2f}ms",
+                f"{transfered_bytes / 1000:.3f}kB",
+                f"{total_duration * 1000:.2f}ms",
+            )
+            if not keep_alive:
+                reason_close = "No keep alive"
+                break
+            request_start = time.time()
+    except (ConnectionResetError, TimeoutError, BrokenPipeError, ssl.SSLError) as e:
+        reason_close = f"{type(e).__name__}: {e}"
+    except Exception as e:
+        reason_close = f"Unhandled Exception: {e}"
+        traceback.print_exc()
+    finally:
+        if debug:
+            print(
+                f"{client_address[0]}:{client_address[1]} Connection closed {(time.time() - connection_start)*1000:.2f}ms: {reason_close}"
+            )
+        conn.shutdown(socket.SHUT_RDWR)
+        conn.close()
+
+
+def sni_callback(ssl_sock: WrappedSSLSocket, hostname: str, context: ssl.SSLContext) -> None:
+    # Store SNI to validate against Host header
+    ssl_sock.intercepted_sni_hostname = hostname
+
+
+def http_server(
+    handler: RequestHandler,
+    host: str = "0.0.0.0",
+    port: int = 8000,
+    threads: int = 20,
+    keep_alive: bool = False,
+    use_tls: bool = False,
+    tls_crt: Path | None = None,
+    tls_key: Path | None = None,
+    debug: bool = False,
+) -> None:
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     # Disable Nagle's algorithm https://en.wikipedia.org/wiki/Nagle's_algorithm
     sock.setsockopt(socket.SOL_TCP, socket.TCP_NODELAY, 1)
     server_address = (host, port)
     sock.bind(server_address)
-    sock.listen(10)
+    sock.listen(socket.SOMAXCONN)
     print(f"socketserver listening on {host}:{port}")
-
-    with concurrent.futures.ThreadPoolExecutor(threads) as e:
-        while True:
-            if e._work_queue.qsize() > threads:
-                print("Warn: All threads busy")
-                while e._work_queue.qsize() > threads:
-                    time.sleep(0.1)
-                print("Threads available")
-            conn, client_address = sock.accept()
-            e.submit(connection_handler, conn, client_address, handler)
+    # Create a tls context if tls is enabled
+    maybe_ssl: typing.ContextManager[socket.socket | ssl.SSLSocket] = contextlib.nullcontext(sock)
+    if use_tls:
+        if tls_crt is None or tls_key is None:
+            raise Exception("Missing tsl_crt or tsl_key")
+        ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ssl_context.load_cert_chain(tls_crt, tls_key)
+        # Wrap to store SNI for validation
+        ssl_context.sslsocket_class = WrappedSSLSocket
+        ssl_context.sni_callback = sni_callback  # type: ignore
+        maybe_ssl = ssl_context.wrap_socket(sock, server_side=True, do_handshake_on_connect=False)
+    with maybe_ssl as sock:
+        max_queue = 200
+        # Connection thread pool
+        with concurrent.futures.ThreadPoolExecutor(threads) as e:
+            while True:
+                if e._work_queue.qsize() > max_queue:
+                    print(f"Warn: All threads busy. Queue of {e._work_queue.qsize()}")
+                    while e._work_queue.qsize() > max_queue:
+                        time.sleep(0.001)
+                    print("Threads available")
+                conn, client_address = sock.accept()
+                e.submit(connection_handler, conn, client_address, handler, keep_alive, use_tls, debug)
 
 
 @dataclass
