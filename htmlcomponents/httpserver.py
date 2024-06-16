@@ -100,22 +100,11 @@ def file_content_iterator(
             pos = f.tell()
             if to_offset and (pos + chunk_size) >= to_offset:
                 yield f.read(to_offset - pos)
-                return
+                break
             data = f.read(chunk_size)
             if data == b"":
-                return
+                break
             yield data
-
-
-def is_connection_alive(conn: socket.socket) -> bool:
-    try:
-        if conn.recv(1, socket.MSG_DONTWAIT | socket.MSG_PEEK) == b"":
-            return False
-    except BlockingIOError:
-        return True
-    except ConnectionResetError:
-        return False
-    return True
 
 
 def match_path(pattern: str, path: str) -> Dict[str, str] | None:
@@ -206,7 +195,6 @@ class Request:
     request_start: float
     matched_route: str | None
     matched_route_mapping: Dict[str, str] | None
-    _conn: socket.socket | None  # Not available in wsgi mode
 
     def __repr__(self) -> str:
         return f"Request<{self.method.value} {self.matched_route}>"
@@ -234,11 +222,12 @@ class Request:
             time.time(),
             None,
             None,
-            None,
         )
 
     @staticmethod
-    def from_raw(remote_addr: str, header: bytes, body_byte_stream: BinaryIO, conn: socket.socket | None) -> Request:
+    def from_raw(
+        remote_addr: str, header: bytes, buf_sock_reader: BufferedSocketReader, conn: socket.socket | None
+    ) -> Request:
         http_code_header, *http_headers = header.decode().split("\r\n")
         raw_method, url, _protocol = http_code_header.split()
         method = Method(raw_method)
@@ -247,7 +236,7 @@ class Request:
         headers = Headers.from_raw(http_headers)
         # Read body if content_length
         content_length = int(headers.get("Content-Length", 0))
-        body = body_byte_stream.read(content_length) if content_length else b""
+        body = buf_sock_reader.read(content_length) if content_length else b""
         return Request(
             headers.get("X-Forwarded-For") or remote_addr,  # TODO: Security
             method,
@@ -259,7 +248,6 @@ class Request:
             time.time(),
             None,
             None,
-            conn,
         )
 
     def get_session(self) -> Dict[Any, Any]:
@@ -287,13 +275,6 @@ class Request:
         print(self)
         for k, v in dataclasses.asdict(self).items():
             print(" ", k, v)
-
-    def assert_connection_ok(self) -> None:
-        """Detects if the connection is broken/client is disconnected. Not supported in WSGI mode"""
-        if self._conn is None:
-            raise NotImplementedError("Server does not expose socket.")
-        if not is_connection_alive(self._conn):
-            raise ConnectionError("Connection closed by remote")
 
 
 @dataclass
@@ -492,35 +473,48 @@ class App:
 
 
 class BufferedSocketReader:
-    def __init__(self, conn: socket.socket) -> None:
+    def __init__(self, conn: socket.socket, timeout: int = 5) -> None:
         self.conn = conn
         self.buffer: bytes = b""
         self.max_buf_size = 10e6  # bytes
-        self.timeout = 5  # seconds
+        self.timeout = timeout  # seconds
+
+        self.conn.settimeout(self.timeout)
 
     def _recv_to_buf(self, size: int) -> None:
-        r, _, _ = select.select([self.conn], [], [], self.timeout)
-        if r:
+        try:
             recv = self.conn.recv(size)
-            if recv == b"":
-                raise ConnectionResetError("Client closed connection")
-            self.buffer += recv
-        else:
-            raise TimeoutError(f"Read timeout {self.timeout}s")
+        except TimeoutError:
+            raise TimeoutError(f"Read timed out after {self.timeout}s")
+        if recv == b"":
+            raise ConnectionResetError("Client closed connection")
+        self.buffer += recv
         if len(self.buffer) > self.max_buf_size:
             raise Exception(f"Read buffer exceeds max size: {len(self.buffer)} > {self.max_buf_size}")
 
-    def read_to_delimiter(self, delimiter: bytes) -> bytes | None:
+    def read_to_delimiter(self, delimiter: bytes) -> bytes:
         while delimiter not in self.buffer:
             self._recv_to_buf(1024)
         data, self.buffer = self.buffer.split(delimiter, maxsplit=1)
-        return data
+        return data + delimiter
 
     def read(self, size: int) -> bytes:
         while len(self.buffer) < size:
             self._recv_to_buf(size - len(self.buffer))
         data, self.buffer = self.buffer[:size], self.buffer[size:]
         return data
+
+    def is_alive(self) -> bool:
+        try:
+            self.conn.settimeout(0)
+            self._recv_to_buf(1)
+        except (BlockingIOError, ssl.SSLWantReadError):
+            return True
+        except Exception as e:
+            return False
+        finally:
+            self.conn.settimeout(self.timeout)
+        raise Exception("Unexpected data from socket")
 
 
 RequestHandler = Callable[[Request], Response]
@@ -544,11 +538,15 @@ def http_server(handler: RequestHandler, host: str = "0.0.0.0", port: int = 8000
             conn.sendall(f"HTTP/1.1 {response.code} {phrase}\r\n".encode())
             conn.sendall(b"\r\n".join([f"{k}: {v}".encode() for k, v in response.headers.raw_headers]))
             conn.sendall(b"\r\n\r\n")
+
+            # Send body
+            transfered_bytes = 0
             body_iterable = iter([response.body]) if isinstance(response.body, bytes) else response.body
             for chunk in body_iterable:
-                if chunk == b"" and not is_connection_alive(conn):
+                transfered_bytes += len(chunk)
+                if chunk == b"" and not socket_reader.is_alive():
                     # Endpoint can yield b"" to verify connection status
-                    raise ConnectionResetError("Connection closed by remote.")
+                    break
                 conn.sendall(chunk)
         except (ConnectionResetError, TimeoutError, BrokenPipeError):
             pass
@@ -781,7 +779,6 @@ if __name__ == "__main__":
 
     @app.get("/")
     def index(request: Request) -> Response:
-        request._conn = None  # To make it work with .asdict
         data = dataclasses.asdict(request)
         data["headers"] = request.headers.to_dict()
         data["body"] = data["body"].decode()  # To make it work with json.dumps
