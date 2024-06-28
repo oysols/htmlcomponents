@@ -61,7 +61,7 @@ class Component:
     def render_component(self, indent: int = 0) -> List[str]:
         # Handle special attrs
         attrs = {}
-        special_replacements = {"class_": "class"}
+        special_replacements = {"class_": "class", "for_": "for"}
         for k, v in self.attrs.items():
             if replacement := special_replacements.get(k):
                 k = replacement
