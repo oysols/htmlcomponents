@@ -147,14 +147,13 @@ class Headers:
         return Headers([(k.strip(), v.strip()) for k, v in [header.split(":", 1) for header in http_headers if header]])
 
     @overload
-    def get(self, key: str) -> None | str:
-        ...
+    def get(self, key: str) -> str | None: ...
 
     @overload
-    def get(self, key: str, default: T) -> T | str:
-        ...
+    def get(self, key: str, default: T) -> str | T: ...
 
-    def get(self, key, default=None):
+    # Replace overloads with TypeVar Defaults in Python 3.13 https://peps.python.org/pep-0696
+    def get(self, key: str, default: T = None) -> str | T:  # type: ignore
         for k, v in self.raw_headers:
             if k.lower() == key.lower():
                 return v
@@ -551,7 +550,7 @@ def connection_handler(
         while True:  # Reuse connection if keep alive is set
             request_start = time.time()
             header = socket_reader.read_to_delimiter(b"\r\n\r\n")
-            request = Request.from_raw(client_address[0], header, socket_reader, conn)  # type: ignore
+            request = Request.from_raw(client_address[0], header, socket_reader, conn)
 
             # Validate that Host matches SNI
             if use_tls:
@@ -605,9 +604,11 @@ def connection_handler(
                     f"{request_handler_duration * 1000:.2f}ms",
                     f"{transfered_bytes / 1000:.3f}kB",
                     f"{total_duration * 1000:.2f}ms",
-                    f"{type(transfer_exception).__name__}: {transfer_exception}"
-                    if transfer_exception is not None
-                    else "",
+                    (
+                        f"{type(transfer_exception).__name__}: {transfer_exception}"
+                        if transfer_exception is not None
+                        else ""
+                    ),
                 )
             if not keep_alive:
                 reason_for_close = "No keep alive"
@@ -724,7 +725,7 @@ def validate_and_cast_to_type(
     # Basic types
     simple_types = [int, float, str, bool, bytes]
     if data_type in simple_types:
-        if cast_int_to_float and isinstance(data, int) and data_type == float:
+        if cast_int_to_float and isinstance(data, int) and data_type is float:
             return float(data)  # type: ignore
         if cast_str_to_int_and_float and isinstance(data, str) and data_type in [int, float]:
             return data_type(data)  # type: ignore
@@ -745,12 +746,12 @@ def validate_and_cast_to_type(
     # Generic types
     elif hasattr(data_type, "__origin__"):
         # List[type]
-        if data_type.__origin__ == list:  # type: ignore
+        if data_type.__origin__ is list:  # type: ignore
             (item_type,) = data_type.__args__  # type: ignore
             return [validate_and_cast_to_type(item, item_type, **options) for item in data]  # type: ignore
         # TODO: Tuple
         # Dict[type, type]
-        elif data_type.__origin__ == dict:  # type: ignore
+        elif data_type.__origin__ is dict:  # type: ignore
             key_type, value_type = data_type.__args__  # type: ignore
             return {
                 validate_and_cast_to_type(key, key_type, **options): validate_and_cast_to_type(
