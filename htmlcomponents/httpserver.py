@@ -25,7 +25,6 @@ from pathlib import Path
 from types import UnionType
 from typing import (
     Any,
-    BinaryIO,
     Callable,
     Dict,
     Iterable,
@@ -512,7 +511,7 @@ class BufferedSocketReader:
             self._recv_to_buf(1)
         except (BlockingIOError, ssl.SSLWantReadError):
             return True
-        except Exception as e:
+        except Exception:
             return False
         finally:
             self.conn.settimeout(self.timeout)
@@ -534,21 +533,23 @@ def connection_handler(
     use_tls: bool,
     debug: bool = False,
 ) -> None:
-    reason_close = None
     connection_start = time.time()
+    pretty_client_address = f"{client_address[0]}:{client_address[1]}"
+    reason_for_close = None
+    if debug:
+        print(f"{pretty_client_address} Connection opened")
     try:
-        request_start = time.time()
-        if debug:
-            print(f"{client_address[0]}:{client_address[1]} Connection opened")
-
         # Perform SSL handshake inside thread to avoid blocking main loop
         if use_tls:
             assert isinstance(conn, WrappedSSLSocket)
             conn.settimeout(5)
             conn.do_handshake()
+            if debug:
+                print(f"{pretty_client_address} Connection TLS handshake {(time.time() - connection_start)*1000:.2f}ms")
 
         socket_reader = BufferedSocketReader(conn)
         while True:  # Reuse connection if keep alive is set
+            request_start = time.time()
             header = socket_reader.read_to_delimiter(b"\r\n\r\n")
             request = Request.from_raw(client_address[0], header, socket_reader, conn)  # type: ignore
 
@@ -581,38 +582,45 @@ def connection_handler(
             # Send body
             transfered_bytes = 0
             body_iterable = iter([response.body]) if isinstance(response.body, bytes) else response.body
-            for chunk in body_iterable:
-                transfered_bytes += len(chunk)
-                if chunk == b"" and not socket_reader.is_alive():
-                    # Endpoint can yield b"" to verify connection status
-                    break
-                conn.sendall(chunk)
-
-            # Logging
-            total_duration = time.time() - request_start
-            print(
-                f"{client_address[0]}:{client_address[1]}",
-                request.headers.get("Host"),
-                response.code,
-                request.method.value,
-                request.path,
-                f"{request_handler_duration * 1000:.2f}ms",
-                f"{transfered_bytes / 1000:.3f}kB",
-                f"{total_duration * 1000:.2f}ms",
-            )
+            transfer_exception = None
+            try:
+                for chunk in body_iterable:
+                    transfered_bytes += len(chunk)
+                    if chunk == b"" and not socket_reader.is_alive():
+                        # Endpoint can yield b"" to verify connection status
+                        break
+                    conn.sendall(chunk)
+            except Exception as e:
+                transfer_exception = e
+                raise
+            finally:
+                # Request logging
+                total_duration = time.time() - request_start
+                print(
+                    pretty_client_address,
+                    request.headers.get("Host"),
+                    response.code,
+                    request.method.value,
+                    request.path,
+                    f"{request_handler_duration * 1000:.2f}ms",
+                    f"{transfered_bytes / 1000:.3f}kB",
+                    f"{total_duration * 1000:.2f}ms",
+                    f"{type(transfer_exception).__name__}: {transfer_exception}"
+                    if transfer_exception is not None
+                    else "",
+                )
             if not keep_alive:
-                reason_close = "No keep alive"
+                reason_for_close = "No keep alive"
                 break
-            request_start = time.time()
     except (ConnectionResetError, TimeoutError, BrokenPipeError, ssl.SSLError) as e:
-        reason_close = f"{type(e).__name__}: {e}"
+        reason_for_close = f"{type(e).__name__}: {e}"
     except Exception as e:
-        reason_close = f"Unhandled Exception: {e}"
+        reason_for_close = f"Unhandled Exception: {e}"
         traceback.print_exc()
     finally:
         if debug:
             print(
-                f"{client_address[0]}:{client_address[1]} Connection closed {(time.time() - connection_start)*1000:.2f}ms: {reason_close}"
+                f"{pretty_client_address} Connection closed {(time.time() - connection_start)*1000:.2f}ms: {reason_for_close}"
             )
         conn.shutdown(socket.SHUT_RDWR)
         conn.close()
