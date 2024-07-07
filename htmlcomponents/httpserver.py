@@ -230,7 +230,7 @@ class Request:
 
     @staticmethod
     def from_raw(
-        remote_addr: str, header: bytes, buf_sock_reader: BufferedSocketReader, conn: socket.socket | None
+        remote_addr: str, header: bytes, buf_sock_reader: BufferedSocketReader, read_x_forwarded_for: bool = False
     ) -> Request:
         http_code_header, *http_headers = header.decode().split("\r\n")
         raw_method, url, _protocol = http_code_header.split()
@@ -485,27 +485,41 @@ class BufferedSocketReader:
     def __init__(self, conn: socket.socket, timeout: int = 5) -> None:
         self.conn = conn
         self.buffer: bytes = b""
-        self.max_buf_size = 10e6  # bytes
+        self.max_buf_size = 10_000_000  # bytes
         self.timeout = timeout  # seconds
+        self._stream_byte_count = 0
 
         self.conn.settimeout(self.timeout)
 
     def _recv_to_buf(self, size: int) -> None:
+        if size <= 0:
+            return
         try:
             recv = self.conn.recv(size)
         except TimeoutError:
             raise TimeoutError(f"Read timed out after {self.timeout}s")
         if recv == b"":
             raise ConnectionResetError("Client closed connection")
+        self._stream_byte_count += len(recv)
         self.buffer += recv
         if len(self.buffer) > self.max_buf_size:
             raise Exception(f"Read buffer exceeds max size: {len(self.buffer)} > {self.max_buf_size}")
 
-    def read_to_delimiter(self, delimiter: bytes) -> bytes:
+    def iterate_until_delimiter(self, delimiter: bytes, chunk_size: int) -> Iterator[bytes]:
         while delimiter not in self.buffer:
-            self._recv_to_buf(1024)
+            if len(self.buffer) >= (chunk_size + len(delimiter) - 1):
+                data, self.buffer = self.buffer[:chunk_size], self.buffer[chunk_size:]
+                yield data
+            else:
+                self._recv_to_buf(4096)
         data, self.buffer = self.buffer.split(delimiter, maxsplit=1)
-        return data + delimiter
+        yield data
+
+    def read_to_delimiter(self, delimiter: bytes) -> bytes:
+        data = b""
+        for chunk in self.iterate_until_delimiter(delimiter, self.max_buf_size):
+            data += chunk
+        return data
 
     def read(self, size: int) -> bytes:
         while len(self.buffer) < size:
@@ -525,6 +539,16 @@ class BufferedSocketReader:
             self.conn.settimeout(self.timeout)
         raise Exception("Unexpected data from socket")
 
+    def reset_byte_counter(self) -> None:
+        self._stream_byte_count = len(self.buffer)
+
+    def get_byte_count(self) -> int:
+        return self._stream_byte_count - len(self.buffer)
+
+    def set_timeout(self, timeout: int) -> None:
+        self.timeout = timeout
+        self.conn.settimeout(timeout)
+
 
 RequestHandler = Callable[[Request], Response]
 
@@ -535,17 +559,18 @@ class WrappedSSLSocket(ssl.SSLSocket):
 
 def connection_handler(
     conn: socket.socket | WrappedSSLSocket,
-    client_address: str,
+    client_address: tuple[str, str],
     handler: RequestHandler,
     keep_alive: bool,
     use_tls: bool,
+    read_x_forwarded_for: bool,
     debug: bool = False,
 ) -> None:
     connection_start = time.time()
-    pretty_client_address = f"{client_address[0]}:{client_address[1]}"
+    debug_address_prefix = f"{client_address[0]}:{client_address[1]}"
     reason_for_close = None
     if debug:
-        print(f"{pretty_client_address} Connection opened")
+        print(f"{debug_address_prefix} Connection opened")
     try:
         # Perform SSL handshake inside thread to avoid blocking main loop
         if use_tls:
@@ -553,13 +578,13 @@ def connection_handler(
             conn.settimeout(5)
             conn.do_handshake()
             if debug:
-                print(f"{pretty_client_address} Connection TLS handshake {(time.time() - connection_start)*1000:.2f}ms")
+                print(f"{debug_address_prefix} Connection TLS handshake {(time.time() - connection_start)*1000:.2f}ms")
 
         socket_reader = BufferedSocketReader(conn)
         while True:  # Reuse connection if keep alive is set
             request_start = time.time()
             header = socket_reader.read_to_delimiter(b"\r\n\r\n")
-            request = Request.from_raw(client_address[0], header, socket_reader, conn)
+            request = Request.from_raw(client_address[0], header, socket_reader, read_x_forwarded_for)
 
             # Validate that Host matches SNI
             if use_tls:
@@ -604,8 +629,10 @@ def connection_handler(
             finally:
                 # Request logging
                 total_duration = time.time() - request_start
+                x_forwarded_for = request.headers.get("X-Forwarded-For", "").split(",")[0]
+                log_client_address = x_forwarded_for if x_forwarded_for and read_x_forwarded_for else client_address[0]
                 print(
-                    pretty_client_address,
+                    log_client_address if not debug else f"{debug_address_prefix} {log_client_address}",
                     request.headers.get("Host"),
                     response.code,
                     request.method.value,
@@ -630,7 +657,7 @@ def connection_handler(
     finally:
         if debug:
             print(
-                f"{pretty_client_address} Connection closed {(time.time() - connection_start)*1000:.2f}ms: {reason_for_close}"
+                f"{debug_address_prefix} Connection closed {(time.time() - connection_start)*1000:.2f}ms: {reason_for_close}"
             )
         conn.shutdown(socket.SHUT_RDWR)
         conn.close()
@@ -650,6 +677,7 @@ def http_server(
     use_tls: bool = False,
     tls_crt: Path | None = None,
     tls_key: Path | None = None,
+    read_x_forwarded_for: bool = False,
     debug: bool = False,
 ) -> None:
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -682,7 +710,9 @@ def http_server(
                         time.sleep(0.001)
                     print("Threads available")
                 conn, client_address = sock.accept()
-                e.submit(connection_handler, conn, client_address, handler, keep_alive, use_tls, debug)
+                e.submit(
+                    connection_handler, conn, client_address, handler, keep_alive, use_tls, read_x_forwarded_for, debug
+                )
 
 
 @dataclass
@@ -896,7 +926,8 @@ def iterate_from_chunked_encoding(socket_reader: BufferedSocketReader) -> Iterat
 
 
 def iterate_from_content_length(socket_reader: BufferedSocketReader, content_length: int) -> Iterator[bytes]:
-    chunk = 1024 * 1024
+    chunk = 4096
+    socket_reader.reset_byte_counter()
     remaining_bytes = content_length
     while remaining_bytes > 0:
         if remaining_bytes <= chunk:
@@ -925,10 +956,13 @@ def proxy_request(request: Request, host: str, port: int) -> Response:
     data += "\r\n"
 
     # Proxy the request
-    s.sendall(data.encode() + request.body)
+    s.sendall(data.encode())
+    for chunk in iterate_from_content_length(request.stream, int(request.headers.get("Content-Length", 0))):
+        s.sendall(chunk)
 
     # Parse proxied response headers
     socket_reader = BufferedSocketReader(s, timeout=5)
+    socket_reader.set_timeout(60)  # Long timeout since this is the "trusted" side
     header = socket_reader.read_to_delimiter(b"\r\n\r\n")
     http_top_header, *http_headers = header.decode().split("\r\n")
     _protocol, code, *_description = http_top_header.split()
