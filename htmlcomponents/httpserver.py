@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import binascii
+from itertools import zip_longest
 import concurrent.futures
 import contextlib
 import dataclasses
@@ -115,11 +116,19 @@ def match_path(pattern: str, path: str) -> Dict[str, str] | None:
     assert path.startswith("/")
     regex_parts = pattern.split("/")[1:]
     path_parts = path.split("/")[1:]
-    if len(regex_parts) != len(path_parts):
+    # Short ciruit so we know that path_parts is always equal or longer in zip_longest
+    if len(regex_parts) > len(path_parts):
         return None
-    for pattern_part, path_part in zip(regex_parts, path_parts):
-        if pattern_part == path_part:
+    glob = None
+    for pattern_part, path_part in zip_longest(regex_parts, path_parts):
+        if glob is not None:
+            parsed[glob] += f"/{path_part}"
             continue
+        elif pattern_part == path_part:
+            continue
+        elif pattern_part.startswith("<*") and pattern_part.endswith(">"):
+            glob = pattern_part[2:-1]
+            parsed[glob] = path_part
         elif pattern_part.startswith("<") and pattern_part.endswith(">"):
             if not path_part:
                 return None
@@ -424,7 +433,7 @@ class App:
     ) -> None:
         CHUNK_SIZE = 1024 * 1024
         resolved_local_path = local_path.resolve()
-        route = str(Path("/") / base_route.strip("/") / "<path>")
+        route = str(Path("/") / base_route.strip("/") / "<*path>")
 
         @self.get(route)
         @cast_request
