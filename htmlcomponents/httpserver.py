@@ -258,6 +258,9 @@ class Request:
         self._cached_body = self.stream.read(content_length) if content_length else b""
         return self._cached_body
 
+    def to_multipart(self) -> "Multipart":
+        return MultiPart.from_request(self)
+
     def get_session(self) -> Dict[Any, Any]:
         # Parse session cookie
         # https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Cookie
@@ -479,6 +482,67 @@ class App:
                 200,
                 headers | {"Content-Length": str(file_size)},
             )
+
+
+@dataclass
+class MultiPartSubPart:
+    headers: Headers | None
+    form_name: str | None
+    form_filename: str | None
+    data_iterator: Iterator[bytes]
+
+    def data(self):
+        return b"".join(self.data_iterator)
+
+
+@dataclass
+class MultiPart:
+    buffered_reader: BufferedSocketReader
+    delimiter: bytes
+    content_length: int
+
+    @staticmethod
+    def from_request(request: Request) -> "MultiPart":
+        # Get multipart delimiter
+        multipart_content_type, boundary = request.headers.get("Content-Type", "").split(";")
+        assert multipart_content_type.strip() == "multipart/form-data"
+        _, boundary_token = boundary.strip().split("=")
+        delimiter = f"\r\n--{boundary_token}".encode()
+        # Get content-length
+        content_length_str = request.headers.get("Content-Length")
+        assert content_length_str is not None
+        content_length = int(content_length_str)
+        request.stream.reset_byte_counter()
+        # Discard data until first delimiter (this delimiter does not start with \r\n)
+        request.stream.read_to_delimiter(delimiter[2:])
+        return MultiPart(request.stream, delimiter, content_length)
+
+    def __iter__(self) -> Iterator[MultiPartSubPart]:
+        while True:
+            raw_headers = self.buffered_reader.read_to_delimiter(b"\r\n\r\n")
+            headers = Headers.from_raw(raw_headers.decode().split("\r\n"))
+            content_disposition = headers.get("Content-Disposition")
+            assert content_disposition is not None
+            form_data_string, *form_data_kv = content_disposition.split(";")
+            assert form_data_string == "form-data"
+            parameters = {k.strip(): v.strip().strip('"') for k, v in [kv.split("=") for kv in form_data_kv]}
+
+            data_iterator = self._read_part_iterator()
+            yield MultiPartSubPart(headers, parameters.get("name"), parameters.get("filename"), data_iterator)
+            for _ in data_iterator:  # Make sure iterator is exhausted
+                pass
+            # Read trailing data
+            trailing = self.buffered_reader.read(2)
+            if trailing == b"--":
+                trailing = self.buffered_reader.read(2)
+                assert trailing == b"\r\n"
+                break
+            assert trailing == b"\r\n"
+        assert self.buffered_reader.get_byte_count() == self.content_length
+
+    def _read_part_iterator(self, chunk_size: int = 4096) -> Iterator[bytes]:
+        for chunk in self.buffered_reader.iterate_until_delimiter(self.delimiter, chunk_size):
+            yield chunk
 
 
 class BufferedSocketReader:
@@ -970,8 +1034,7 @@ def proxy_request(request: Request, host: str, port: int) -> Response:
             s.sendall(chunk)
 
     # Parse proxied response headers
-    socket_reader = BufferedSocketReader(s, timeout=5)
-    socket_reader.set_timeout(60)  # Long timeout since this is the "trusted" side
+    socket_reader = BufferedSocketReader(s, timeout=60)
     header = socket_reader.read_to_delimiter(b"\r\n\r\n")
     http_top_header, *http_headers = header.decode().split("\r\n")
     _protocol, code, *_description = http_top_header.split()
