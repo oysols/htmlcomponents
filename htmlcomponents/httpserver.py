@@ -255,8 +255,8 @@ class Request:
         if self._cached_body is not None:
             return self._cached_body
         content_length = int(self.headers.get("Content-Length", 0))
-        self._body = self.stream.read(content_length) if content_length else b""
-        return self._body
+        self._cached_body = self.stream.read(content_length) if content_length else b""
+        return self._cached_body
 
     def get_session(self) -> Dict[Any, Any]:
         # Parse session cookie
