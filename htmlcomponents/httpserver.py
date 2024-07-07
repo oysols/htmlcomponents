@@ -709,7 +709,14 @@ def http_server(
                     while e._work_queue.qsize() > max_queue:
                         time.sleep(0.001)
                     print("Threads available")
-                conn, client_address = sock.accept()
+                try:
+                    conn, client_address = sock.accept()
+                except Exception as exception:
+                    # Observed an error once
+                    # OSError: [Errno 107] Transport endpoint is not connected
+                    print(f"Error during accept() in main thread: {exception}")
+                    traceback.print_exc()
+                    continue
                 e.submit(
                     connection_handler, conn, client_address, handler, keep_alive, use_tls, read_x_forwarded_for, debug
                 )
