@@ -198,11 +198,11 @@ class Request:
     path: str
     query_params: Dict[str, str]
     headers: Headers
-    content_length: int
-    body: bytes
+    stream: BufferedSocketReader
     request_start: float
     matched_route: str | None
     matched_route_mapping: Dict[str, str] | None
+    _cached_body: bytes | None = None
 
     def __repr__(self) -> str:
         return f"Request<{self.method.value} {self.matched_route}>"
@@ -216,17 +216,13 @@ class Request:
         raw_headers = [(k[5:].replace("_", "-"), v) for k, v in environ.items() if k.startswith("HTTP_")]
         headers = Headers(raw_headers)
         remote_addr = environ["REMOTE_ADDR"]
-        # Read body if content_length
-        content_length = int(environ["CONTENT_LENGTH"]) if environ["CONTENT_LENGTH"] else 0
-        body = environ["wsgi.input"].read(content_length) if content_length else b""
         return Request(
             remote_addr,
             method,
             path,
             query_params,
             headers,
-            content_length,
-            body,
+            environ["wsgi.input"],  # Not correct type, but does support `.read`
             time.time(),
             None,
             None,
@@ -242,21 +238,25 @@ class Request:
         path, *query_string = url.split("?", 1)
         query_params = dict(urllib.parse.parse_qsl(query_string[0], keep_blank_values=True)) if query_string else {}
         headers = Headers.from_raw(http_headers)
-        # Read body if content_length
-        content_length = int(headers.get("Content-Length", 0))
-        body = buf_sock_reader.read(content_length) if content_length else b""
         return Request(
             headers.get("X-Forwarded-For") or remote_addr,  # TODO: Security
             method,
             path,
             query_params,
             headers,
-            content_length,
-            body,
+            buf_sock_reader,
             time.time(),
             None,
             None,
         )
+
+    def body(self) -> bytes:
+        # TODO: Read from chunked encoding
+        if self._cached_body is not None:
+            return self._cached_body
+        content_length = int(self.headers.get("Content-Length", 0))
+        self._body = self.stream.read(content_length) if content_length else b""
+        return self._body
 
     def get_session(self) -> Dict[Any, Any]:
         # Parse session cookie
@@ -274,10 +274,10 @@ class Request:
         return session
 
     def form_data(self) -> Dict[str, str]:
-        return dict(urllib.parse.parse_qsl(self.body.decode(), keep_blank_values=True))
+        return dict(urllib.parse.parse_qsl(self.body().decode(), keep_blank_values=True))
 
     def json(self) -> Dict[str, Any]:
-        return json.loads(self.body.decode())  # type: ignore
+        return json.loads(self.body().decode())  # type: ignore
 
     def print(self) -> None:
         print(self)
@@ -797,7 +797,7 @@ def request_to_spec(
             case ["request"]:
                 value = request
             case ["body"]:
-                value = request.body
+                value = request.body()
             case ["body", "form_data"]:
                 value = request.form_data()
             case ["header", header]:
@@ -884,8 +884,8 @@ def iterate_from_chunked_encoding(socket_reader: BufferedSocketReader) -> Iterat
     while True:
         buffer = b""
         chunk = socket_reader.read_to_delimiter(b"\r\n")
-        length = int(chunk[:-2], 16)
-        buffer += chunk
+        length = int(chunk, 16)
+        buffer += chunk + b"\r\n"
         if length == 0:
             yield buffer
             break
