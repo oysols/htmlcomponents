@@ -505,6 +505,22 @@ class BufferedSocketReader:
         if len(self.buffer) > self.max_buf_size:
             raise Exception(f"Read buffer exceeds max size: {len(self.buffer)} > {self.max_buf_size}")
 
+    def read(self, size: int) -> bytes:
+        while len(self.buffer) < size:
+            self._recv_to_buf(size - len(self.buffer))
+        data, self.buffer = self.buffer[:size], self.buffer[size:]
+        return data
+
+    def iterate_until_size(self, size: int) -> Iterator[bytes]:
+        chunk_size = 4096
+        remaining_bytes = size
+        while remaining_bytes > 0:
+            if remaining_bytes <= chunk_size:
+                yield self.read(remaining_bytes)
+                break
+            yield self.read(chunk_size)
+            remaining_bytes -= chunk_size
+
     def iterate_until_delimiter(self, delimiter: bytes, chunk_size: int) -> Iterator[bytes]:
         while delimiter not in self.buffer:
             if len(self.buffer) >= (chunk_size + len(delimiter) - 1):
@@ -521,11 +537,20 @@ class BufferedSocketReader:
             data += chunk
         return data
 
-    def read(self, size: int) -> bytes:
-        while len(self.buffer) < size:
-            self._recv_to_buf(size - len(self.buffer))
-        data, self.buffer = self.buffer[:size], self.buffer[size:]
-        return data
+    def iterate_from_chunked_encoding(self, include_encoding: bool = False) -> Iterator[bytes]:
+        while True:
+            raw_length = self.read_to_delimiter(b"\r\n")
+            length = int(raw_length, 16)
+            raw_stream = raw_length + b"\r\n"
+            if length == 0:
+                raw_stream += self.read(len("\r\n"))
+                if include_encoding:
+                    yield raw_stream
+                break
+            chunk = self.read(length)
+            raw_stream += chunk
+            raw_stream += self.read(len("\r\n"))
+            yield raw_stream if include_encoding else chunk
 
     def is_alive(self) -> bool:
         try:
@@ -917,33 +942,6 @@ def main() -> None:
     app.run(port=port)
 
 
-def iterate_from_chunked_encoding(socket_reader: BufferedSocketReader) -> Iterator[bytes]:
-    while True:
-        buffer = b""
-        chunk = socket_reader.read_to_delimiter(b"\r\n")
-        length = int(chunk, 16)
-        buffer += chunk + b"\r\n"
-        if length == 0:
-            yield buffer
-            break
-        buffer += socket_reader.read(length)
-        buffer += socket_reader.read(len("\r\n"))
-        yield buffer
-    yield socket_reader.read(len("\r\n"))
-
-
-def iterate_from_content_length(socket_reader: BufferedSocketReader, content_length: int) -> Iterator[bytes]:
-    chunk = 4096
-    socket_reader.reset_byte_counter()
-    remaining_bytes = content_length
-    while remaining_bytes > 0:
-        if remaining_bytes <= chunk:
-            yield socket_reader.read(remaining_bytes)
-            break
-        yield socket_reader.read(chunk)
-        remaining_bytes -= chunk
-
-
 def proxy_request(request: Request, host: str, port: int) -> Response:
     # Connect to proxied host
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -964,8 +962,12 @@ def proxy_request(request: Request, host: str, port: int) -> Response:
 
     # Proxy the request
     s.sendall(data.encode())
-    for chunk in iterate_from_content_length(request.stream, int(request.headers.get("Content-Length", 0))):
-        s.sendall(chunk)
+    if "chunked" in headers.get("Transfer-Encoding", ""):
+        for chunk in request.stream.iterate_from_chunked_encoding(include_encoding=True):
+            s.sendall(chunk)
+    else:
+        for chunk in request.stream.iterate_until_size(int(request.headers.get("Content-Length", 0))):
+            s.sendall(chunk)
 
     # Parse proxied response headers
     socket_reader = BufferedSocketReader(s, timeout=5)
@@ -977,9 +979,9 @@ def proxy_request(request: Request, host: str, port: int) -> Response:
 
     # Proxy body response
     if "chunked" in headers.get("Transfer-Encoding", ""):
-        stream = iterate_from_chunked_encoding(socket_reader)
+        stream = socket_reader.iterate_from_chunked_encoding(include_encoding=True)
     else:
-        stream = iterate_from_content_length(socket_reader, int(headers.get("Content-Length", 0)))
+        stream = socket_reader.iterate_until_size(int(headers.get("Content-Length", 0)))
 
     return Response(stream, int(code), raw_headers=headers)
 
