@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import binascii
-from itertools import zip_longest
 import concurrent.futures
 import contextlib
 import dataclasses
@@ -22,6 +21,7 @@ import traceback
 import typing
 import urllib.parse
 from dataclasses import dataclass
+from itertools import zip_longest
 from pathlib import Path
 from types import UnionType
 from typing import (

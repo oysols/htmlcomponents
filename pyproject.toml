@@ -5,9 +5,11 @@ description = ""
 dependencies = []
 optional-dependencies.dev = [
     "mypy",
-    "black",
     "ruff",
 ]
 
 [project.scripts]
 httpserver = "htmlcomponents:httpserver.main"
+
+[tool.ruff]
+line-length = 120
