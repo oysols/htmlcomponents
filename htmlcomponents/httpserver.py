@@ -1106,23 +1106,27 @@ class ServeStaticPath:
 
 
 if __name__ == "__main__":
-    app = App()
+    router = Router()
 
-    @app.get("/hello")
-    def hello() -> BodyResponse:
-        return "Hello, World!"
-
-    @app.get("/")
+    @router.get("/")
     def index(request: Request) -> Response:
-        data = dataclasses.asdict(request)
-        data["headers"] = request.headers.to_dict()
-        data["body"] = data["body"].decode()  # To make it work with json.dumps
-        data["clear_text_session"] = request.get_session()
+        data = {
+            "remote_addr": request.remote_addr,
+            "method": request.method,
+            "path": request.path,
+            "query_params": request.query_params,
+            "headers": request.headers.to_dict(),
+            "stream": "BufferedSocketReader",
+            "request_start": request.request_start,
+            "matched_route": request.matched_route,
+            "matched_route_mapping": request.matched_route_mapping,
+            "clear_text_cookie": request.get_session(),
+        }
         return Response(data, 200, set_session={"secret": "cookiestuff3"})
 
-    @app.get("/<variable>")
+    @router.get("/<variable>")
     @cast_request
-    def cast(
+    def castit(
         request: Request,
         path_variable: int,
         header_user_agent: str,
@@ -1139,4 +1143,7 @@ if __name__ == "__main__":
                 {body.decode()=:}"""
         )
 
-    app.run()
+    router.run(port=5000)
+
+    #app = App([router])
+    #http_server(app, port=5000)
