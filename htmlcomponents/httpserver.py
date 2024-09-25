@@ -13,17 +13,19 @@ import http.server
 import json
 import mimetypes
 import secrets
+import signal
 import socket
 import ssl
+import sys
 import textwrap
 import time
 import traceback
 import typing
 import urllib.parse
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from itertools import zip_longest
 from pathlib import Path
-from types import UnionType
+from types import FrameType, UnionType
 from typing import (
     Any,
     Callable,
@@ -37,6 +39,7 @@ from typing import (
     Type,
     TypeVar,
     Union,
+    cast,
     overload,
     runtime_checkable,
 )
@@ -64,7 +67,6 @@ class Method(str, enum.Enum):
     post = "POST"
     put = "PUT"
     delete = "DELETE"
-    connect = "CONNECT"
     options = "OPTIONS"
     trace = "TRACE"
     patch = "PATCH"
@@ -112,7 +114,7 @@ def match_path(pattern: str, path: str) -> Dict[str, str] | None:
     # Returns None if it does not match
     # Returns matching variables if included in pattern
     parsed = {}
-    assert pattern.startswith("/")
+    assert pattern.startswith("/"), "Route pattern should start with /"
     assert path.startswith("/")
     regex_parts = pattern.split("/")[1:]
     path_parts = path.split("/")[1:]
@@ -205,7 +207,7 @@ class Request:
     _cached_body: bytes | None = None
 
     def __repr__(self) -> str:
-        return f"Request<{self.method.value} {self.matched_route}>"
+        return f"Request<{self.method.value} {self.path}>"
 
     @staticmethod
     def from_wsgi(environ: Dict[str, Any]) -> "Request":
@@ -258,7 +260,7 @@ class Request:
         self._cached_body = self.stream.read(content_length) if content_length else b""
         return self._cached_body
 
-    def to_multipart(self) -> "Multipart":
+    def to_multipart(self) -> "MultiPart":
         return MultiPart.from_request(self)
 
     def get_session(self) -> Dict[Any, Any]:
@@ -639,7 +641,8 @@ class BufferedSocketReader:
         self.conn.settimeout(timeout)
 
 
-RequestHandler = Callable[[Request], Response]
+RequestHandler = Callable[[Request], Response | None]
+ResponseHandler = Callable[[Request, Response], Response]
 
 
 class WrappedSSLSocket(ssl.SSLSocket):
@@ -688,12 +691,17 @@ def connection_handler(
                         f"Host header does not match SNI {request.headers.get('Host')} != {conn.intercepted_sni_hostname}"
                     )
 
+            # Call request handler
             try:
                 response = handler(request)
+                if response is None:
+                    response = Response("Page not found", 404)
             except Exception:
                 traceback.print_exc()
                 response = Response("Internal Server Error", 500)
             request_handler_duration = time.time() - request.request_start
+
+            # Send headers
             response.headers.set("Server", "httpserver.py")
             response.headers.set("Connection", "keep-alive" if keep_alive else "close")
             phrase, _ = http.server.BaseHTTPRequestHandler.responses[response.code]
@@ -811,12 +819,11 @@ def http_server(
                 )
 
 
-@dataclass
 class WSGIWrapper:
     """Implements WSGIApplication interface: Callable[[WSGIEnvironment, StartResponse], Iterable[bytes]]"""
 
-    def __init__(self, handler: RequestHandler) -> None:
-        self.handler = handler
+    def __init__(self, request_handler: RequestHandler) -> None:
+        self.request_handler = request_handler
 
     def __call__(
         self,
@@ -825,7 +832,9 @@ class WSGIWrapper:
     ) -> Iterable[bytes]:
         request = Request.from_wsgi(environ)
 
-        response = self.handler(request)
+        response = self.request_handler(request)
+        if response is None:
+            response = Response("Page not found", 404)
 
         phrase, _ = http.server.BaseHTTPRequestHandler.responses[response.code]
         start_response(f"{response.code} {phrase}", [(k, v) for k, v in response.headers.raw_headers])
@@ -833,6 +842,14 @@ class WSGIWrapper:
             yield response.body
         else:
             yield from response.body
+
+
+def run_wsgiref(request_handler: RequestHandler, host: str = "0.0.0.0", port: int = 8000) -> None:
+    import wsgiref.simple_server
+
+    with wsgiref.simple_server.make_server(host, port, WSGIWrapper(request_handler)) as httpd:
+        print(f"wsgiref serving on {host}:{port}")
+        httpd.serve_forever()
 
 
 # Endpoint argument parsing
