@@ -761,7 +761,14 @@ def validate_and_cast_to_type(
     cast_dict_to_dataclass: bool = True,
     force_cast_unsupported_datatype: bool = False,
 ) -> T:
-    if isinstance(data, data_type):
+    """
+    >>> validate_and_cast_to_type({"a": [1,2,3]}, dict[str, list[int]])
+    {'a': [1, 2, 3]}
+    >>> validate_and_cast_to_type(33.4, dict | float | None)
+    33.4
+
+    """
+    if not hasattr(data_type, "__origin__") and isinstance(data, data_type):  # If not generic
         return data
     if data_type == Any:
         return data  # type: ignore
@@ -839,8 +846,10 @@ def request_to_spec(
                 value = request
             case ["body"]:
                 value = request.body()
-            case ["body", "form_data"]:
+            case ["form"]:
                 value = request.form_data()
+            case ["form", form_key]:
+                value = request.form_data().get(form_key)
             case ["header", header]:
                 headerized = "-".join([word.title() for word in header.split("_")])
                 value = request.headers.get(headerized)
@@ -851,7 +860,7 @@ def request_to_spec(
             case ["session"]:
                 value = request.get_session()
             case arg:
-                raise Exception(f"Unexpected argument {'_'.join(arg)}")
+                raise Exception(f"Unsupported function argument name: {'_'.join(arg)}")
         try:
             validated_data[name] = validate_and_cast_to_type(value, annotation_type)
         except Exception:
@@ -886,7 +895,8 @@ def cast_request(route_function: Callable[..., RouteFunctionResponse]) -> RouteF
 
     request                 Request
     body                    Request.body
-    body_form_data          Request.form_data()
+    form                    Request.form_data()
+    form_<name>             Request.form_data().get("<name>")
     header_<header_name>    Request.headers.get("<Header-Name>")
     path_<path_variable>    Request.matched_route_mapping.get("<path_variable>")
     param_<param_name>      Request.query_params.get("<param_name>")
