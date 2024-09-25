@@ -362,130 +362,6 @@ RouteFunctionResponse = Response | BodyResponse
 RouteFunction = Callable[[Request], RouteFunctionResponse] | Callable[[], RouteFunctionResponse]
 
 
-class App:
-    routes: List[Tuple[str, str, RouteFunction]]
-
-    def __init__(self) -> None:
-        self.routes = []
-
-    def add_route(self, pattern: str, method: str) -> Callable[[RouteFunction], RouteFunction]:
-        def outer(func: RouteFunction) -> RouteFunction:
-            self.routes.append((method, pattern, func))
-            return func
-
-        return outer
-
-    get = functools.partialmethod(add_route, method=Method.get)
-    post = functools.partialmethod(add_route, method=Method.post)
-
-    @staticmethod
-    def default_route() -> Response:
-        return Response(b"Page not found", 404, {"Content-Type": "text/plain"})
-
-    def get_route(self, method: str, path: str) -> Tuple[str | None, Dict[str, str] | None, RouteFunction]:
-        for route_method, pattern, route_function in self.routes:
-            if route_method != method:
-                continue
-            if (matched_variables := match_path(pattern, path)) is not None:
-                return pattern, matched_variables, route_function
-        return None, None, self.default_route
-
-    @staticmethod
-    def gzip_middleware(request: Request, response: Response) -> None:
-        if isinstance(response.body, bytes) and "gzip" in [
-            encoding.strip() for encoding in request.headers.get("Accept-Encoding", "").split(",")
-        ]:
-            if response.headers.get("Content-Encoding"):
-                return
-            response.body = gzip.compress(response.body)
-            response.headers.set("Content-Encoding", "gzip")
-            response.headers.set("Content-Length", str(len(response.body)))
-
-    def handle(self, request: Request) -> Response:
-        # Get route
-        route, mapping, route_function = self.get_route(request.method, request.path)
-        # Add routing to Request object
-        request.matched_route = route
-        request.matched_route_mapping = mapping
-        # Call route function
-        if route_function.__code__.co_argcount == 0:  # 0 argument types + 1 return type = 1
-            # Function does not take the Request object as argument
-            route_response: RouteFunctionResponse = route_function()  # type: ignore
-        else:
-            # Function takes the Request object as argument
-            route_response = route_function(request)  # type: ignore
-        # Convert RouteFunctionResponse to Response
-        response = route_response if isinstance(route_response, Response) else Response(route_response)
-        # Post processing
-        self.gzip_middleware(request, response)
-        return response
-
-    def run(self, host: str = "0.0.0.0", port: int = 8000) -> None:
-        http_server(self.handle, host, port)
-
-    def to_wsgi(self) -> WSGIWrapper:
-        return WSGIWrapper(self.handle)
-
-    def run_wsgiref(self, host: str = "0.0.0.0", port: int = 8000) -> None:
-        import wsgiref.simple_server
-
-        with wsgiref.simple_server.make_server(host, port, self.to_wsgi()) as httpd:
-            print(f"wsgiref serving on {host}:{port}")
-            httpd.serve_forever()
-
-    def serve_static_path(
-        self, base_route: str, local_path: Path, guess_content_type: bool = True, cache_control: int | None = None
-    ) -> None:
-        CHUNK_SIZE = 1024 * 1024
-        resolved_local_path = local_path.resolve()
-        route = str(Path("/") / base_route.strip("/") / "<*path>")
-
-        @self.get(route)
-        @cast_request
-        def static_path(path_path: str, header_range: str | None) -> Response:
-            local_path = (resolved_local_path / Path(path_path)).resolve()
-            assert local_path.relative_to(resolved_local_path)
-            if not local_path.is_file():
-                return self.default_route()
-            file_size = local_path.stat().st_size
-            content_type = "application/octet-stream"
-            if guess_content_type:
-                content_type = mimetypes.guess_type(local_path)[0] or content_type
-            headers = {
-                "Accept-Ranges": "bytes",
-                "Content-Type": content_type,
-            }
-            if cache_control is not None:
-                headers |= {"Cache-Control": f"private,max-age={cache_control}"}
-            # Support Content-Range to allow remote seeking in files
-            if header_range:
-                try:
-                    bytestring, rangestring = header_range.split("=")
-                    if bytestring != "bytes":
-                        raise TypeError("Unsupported range type")
-                    startstring, endstring = rangestring.split("-")
-                    start = int(startstring)
-                    inclusive_end = int(endstring) if endstring else file_size - 1
-                    if start < 0 or start >= file_size or inclusive_end < start or inclusive_end >= file_size:
-                        raise ValueError("Invalid byte range")
-                except Exception as e:
-                    return Response(f"Invalid Range request: {e}", 400)
-                return Response(
-                    file_content_iterator(local_path, CHUNK_SIZE, start, inclusive_end + 1),
-                    206,
-                    headers
-                    | {
-                        "Content-Range": f"bytes {start}-{inclusive_end}/{file_size}",
-                        "Content-Length": str(file_size - start),
-                    },
-                )
-            return Response(
-                file_content_iterator(local_path, CHUNK_SIZE),
-                200,
-                headers | {"Content-Length": str(file_size)},
-            )
-
-
 @dataclass
 class MultiPartSubPart:
     headers: Headers | None
@@ -1036,13 +912,8 @@ def cast_request(route_function: Callable[..., RouteFunctionResponse]) -> RouteF
 
 def main() -> None:
     """usage: `httpserver [PORT]`"""
-    import sys
-
     port = int(sys.argv[1]) if len(sys.argv) == 2 else 8000
-
-    app = App()
-    app.serve_static_path("", Path("."))
-    app.run(port=port)
+    http_server(ServeStaticPath("", Path(".")), port=port, read_x_forwarded_for=True)
 
 
 def proxy_request(request: Request, host: str, port: int) -> Response:
@@ -1086,6 +957,139 @@ def proxy_request(request: Request, host: str, port: int) -> Response:
         stream = socket_reader.iterate_until_size(int(headers.get("Content-Length", 0)))
 
     return Response(stream, int(code), raw_headers=headers)
+
+
+@dataclass
+class App:
+    request_handlers: list[RequestHandler]
+    response_handlers: list[ResponseHandler] = field(default_factory=list)
+
+    def __call__(self, request: Request) -> Response:
+        for handler in self.request_handlers:
+            app_response = handler(request)
+            if app_response is not None:
+                break
+        else:
+            app_response = Response("Page not found", 404)
+        for response_handler in self.response_handlers:
+            app_response = response_handler(request, app_response)
+        return app_response
+
+
+class Router:
+    routes: List[Tuple[str, str, RouteFunction]]
+
+    def __init__(self) -> None:
+        self.routes = []
+
+    def add_route(self, pattern: str, method: str) -> Callable[[RouteFunction], RouteFunction]:
+        def outer(func: RouteFunction) -> RouteFunction:
+            self.routes.append((method, pattern, func))
+            return func
+
+        return outer
+
+    get = functools.partialmethod(add_route, method=Method.get)
+    post = functools.partialmethod(add_route, method=Method.post)
+
+    def _get_route(self, method: str, path: str) -> Tuple[str, Dict[str, str], RouteFunction] | None:
+        for route_method, pattern, route_function in self.routes:
+            if route_method != method:
+                continue
+            if (matched_variables := match_path(pattern, path)) is not None:
+                return pattern, matched_variables, route_function
+        return None
+
+    def __call__(self, request: Request) -> Response | None:
+        route = self._get_route(request.method, request.path)
+        if route is None:
+            return None
+        pattern, mapping, route_function = route
+        # Add routing to Request object
+        request.matched_route = pattern
+        request.matched_route_mapping = mapping
+        # Call route function
+        if route_function.__code__.co_argcount == 0:  # 0 argument types + 1 return type = 1
+            route_function = cast(Callable[[], RouteFunctionResponse], route_function)
+            # Function does not take the Request object as argument
+            router_response = route_function()
+        else:
+            route_function = cast(Callable[[Request], RouteFunctionResponse], route_function)
+            # Function takes the Request object as argument
+            router_response = route_function(request)
+        # Convert RouteFunctionResponse to Response
+        return router_response if isinstance(router_response, Response) else Response(router_response)
+
+    def run(self, port: int = 5000) -> None:
+        http_server(self, port=port)
+
+
+class ServeStaticPath:
+    CHUNK_SIZE = 1024 * 1024
+
+    def __init__(
+        self, base_route: str, local_path: Path, guess_content_type: bool = True, cache_control: int | None = None
+    ) -> None:
+        self.base_route = base_route.rstrip("/") + "/<*path>"
+        self.resolved_local_path = local_path.resolve()
+        self.guess_content_type = guess_content_type
+        self.cache_control = cache_control
+        if not self.resolved_local_path.is_dir():
+            raise Exception("Expected directory")
+
+    def __call__(self, request: Request) -> Response | None:
+        # Check if we match route
+        match = match_path(self.base_route, request.path)
+        if not match:
+            return None
+        path = match["path"]
+        # Convert to local path
+        local_path = (self.resolved_local_path / Path(path)).resolve()
+        # Assert that file is child of local_path
+        assert local_path.relative_to(self.resolved_local_path)
+        # Check that file exists
+        if not local_path.is_file():
+            return Response("Page not found", 404)
+        # Check file size and prepare response
+        file_size = local_path.stat().st_size
+        content_type = "application/octet-stream"
+        if self.guess_content_type:
+            content_type = mimetypes.guess_type(local_path)[0] or content_type
+        headers = {
+            "Accept-Ranges": "bytes",
+            "Content-Type": content_type,
+        }
+        if self.cache_control is not None:
+            headers |= {"Cache-Control": f"private,max-age={self.cache_control}"}
+
+        # Support Content-Range to allow remote seeking in files
+        header_range = request.headers.get("Range")
+        if header_range:
+            try:
+                bytestring, rangestring = header_range.split("=")
+                if bytestring != "bytes":
+                    raise TypeError("Unsupported range type")
+                startstring, endstring = rangestring.split("-")
+                start = int(startstring)
+                inclusive_end = int(endstring) if endstring else file_size - 1
+                if start < 0 or start >= file_size or inclusive_end < start or inclusive_end >= file_size:
+                    raise ValueError("Invalid byte range")
+            except Exception as e:
+                return Response(f"Invalid Range request: {e}", 400)
+            return Response(
+                file_content_iterator(local_path, self.CHUNK_SIZE, start, inclusive_end + 1),
+                206,
+                headers
+                | {
+                    "Content-Range": f"bytes {start}-{inclusive_end}/{file_size}",
+                    "Content-Length": str(file_size - start),
+                },
+            )
+        return Response(
+            file_content_iterator(local_path, self.CHUNK_SIZE),
+            200,
+            headers | {"Content-Length": str(file_size)},
+        )
 
 
 if __name__ == "__main__":
