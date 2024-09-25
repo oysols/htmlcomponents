@@ -929,7 +929,10 @@ def main() -> None:
 def proxy_request(request: Request, host: str, port: int) -> Response:
     # Connect to proxied host
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.connect((host, port))
+    try:
+        s.connect((host, port))
+    except Exception:
+        return Response("Bad gateway", 502)
 
     # Add proxy headers
     headers = request.headers.copy()
