@@ -760,6 +760,15 @@ def connection_handler(
         conn.close()
 
 
+class SignalHandler:
+    def __init__(self) -> None:
+        self.sigterm = False
+        signal.signal(signal.SIGTERM, self.set_sigterm)
+
+    def set_sigterm(self, signum: int, frame: FrameType | None) -> None:
+        self.sigterm = True
+
+
 def sni_callback(ssl_sock: WrappedSSLSocket, hostname: str, context: ssl.SSLContext) -> None:
     # Store SNI to validate against Host header
     ssl_sock.intercepted_sni_hostname = hostname
@@ -775,16 +784,23 @@ def http_server(
     tls_crt: Path | None = None,
     tls_key: Path | None = None,
     read_x_forwarded_for: bool = False,
+    share_socket: bool = False,
     debug: bool = False,
 ) -> None:
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    if share_socket:
+        # SO_REUSEPORT allows multiple processes to listen on same port
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+    # SO_REUSEADDR allows a process use a port that is in TIME_WAIT from previous process
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     # Disable Nagle's algorithm https://en.wikipedia.org/wiki/Nagle's_algorithm
     sock.setsockopt(socket.SOL_TCP, socket.TCP_NODELAY, 1)
     server_address = (host, port)
     sock.bind(server_address)
     sock.listen(socket.SOMAXCONN)
-    print(f"socketserver listening on {host}:{port}")
+    # Set socket timeout to periodically check signal handler
+    sock.settimeout(1)
+    signal_handler = SignalHandler()
     # Create a tls context if tls is enabled
     maybe_ssl: typing.ContextManager[socket.socket | ssl.SSLSocket] = contextlib.nullcontext(sock)
     if use_tls:
@@ -796,11 +812,15 @@ def http_server(
         ssl_context.sslsocket_class = WrappedSSLSocket
         ssl_context.sni_callback = sni_callback  # type: ignore
         maybe_ssl = ssl_context.wrap_socket(sock, server_side=True, do_handshake_on_connect=False)
+    print(f"socketserver listening on {host}:{port}")
     with maybe_ssl as sock:
-        max_queue = 200
+        max_queue = 100
         # Connection thread pool
         with concurrent.futures.ThreadPoolExecutor(threads) as e:
             while True:
+                if signal_handler.sigterm:
+                    print("Received SIGTERM. Gracefully shutting down.")
+                    break
                 if e._work_queue.qsize() > max_queue:
                     print(f"Warn: All threads busy. Queue of {e._work_queue.qsize()}")
                     while e._work_queue.qsize() > max_queue:
@@ -808,6 +828,8 @@ def http_server(
                     print("Threads available")
                 try:
                     conn, client_address = sock.accept()
+                except TimeoutError:
+                    continue
                 except Exception as exception:
                     # Observed an error once
                     # OSError: [Errno 107] Transport endpoint is not connected
