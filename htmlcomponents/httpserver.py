@@ -369,7 +369,7 @@ class MultiPartSubPart:
     form_filename: str | None
     data_iterator: Iterator[bytes]
 
-    def data(self):
+    def data(self) -> bytes:
         return b"".join(self.data_iterator)
 
 
@@ -1105,6 +1105,22 @@ class ServeStaticPath:
         )
 
 
+def proxy_fix(request: Request) -> None:
+    request.remote_addr = request.headers.get("X-Forwarded-For") or request.remote_addr
+
+
+def gzip_response(request: Request, response: Response) -> Response:
+    if (
+        isinstance(response.body, bytes)
+        and response.headers.get("Content-Encoding") is None
+        and "gzip" in [encoding.strip() for encoding in request.headers.get("Accept-Encoding", "").split(",")]
+    ):
+        response.body = gzip.compress(response.body)
+        response.headers.set("Content-Encoding", "gzip")
+        response.headers.set("Content-Length", str(len(response.body)))
+    return response
+
+
 if __name__ == "__main__":
     router = Router()
 
@@ -1143,7 +1159,5 @@ if __name__ == "__main__":
                 {body.decode()=:}"""
         )
 
-    router.run(port=5000)
-
-    #app = App([router])
-    #http_server(app, port=5000)
+    app = App([proxy_fix, router], response_handlers=[gzip_response])
+    http_server(app, port=5000)
