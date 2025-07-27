@@ -47,6 +47,16 @@ class Component:
         self.style = style.copy()
         self.tag = self.__class__.__name__.replace("_", "-")
 
+        # Handle special attrs
+        new_attrs = {}
+        special_replacements = {"class_": "class", "for_": "for", "is_": "is"}
+        for k, v in self.attrs.items():
+            if replacement := special_replacements.get(k):
+                k = replacement
+            k = k.replace("_", "-")
+            new_attrs[k] = v
+        self.attrs = new_attrs
+
     def __call__(self, *children: Node) -> Self:
         if self.children:
             raise Exception("Component allready has children")
@@ -59,15 +69,8 @@ class Component:
     def render_html(self, indent: int = 0) -> str:
         return "\n".join(self.render_component(indent))
 
-    def render_component(self, indent: int = 0) -> List[str]:
-        # Handle special attrs
-        attrs = {}
-        special_replacements = {"class_": "class", "for_": "for", "is_": "is"}
-        for k, v in self.attrs.items():
-            if replacement := special_replacements.get(k):
-                k = replacement
-            k = k.replace("_", "-")
-            attrs[k] = v
+    def render_component(self, indent: int = 0) -> list[str]:
+        attrs = self.attrs.copy()
         # Convert style dict to inline css
         if self.style:
             attrs["style"] = "; ".join([f"{k}: {v}" for k, v in self.style.items()])
