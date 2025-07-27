@@ -246,11 +246,15 @@ class Request:
         )
 
     def body(self) -> bytes:
-        # TODO: Read from chunked encoding
         if self._cached_body is not None:
             return self._cached_body
-        content_length = int(self.headers.get("Content-Length", 0))
-        self._cached_body = self.stream.read(content_length) if content_length else b""
+        if "chunked" in self.headers.get("Transfer-Encoding", ""):
+            self._cached_body = b""
+            for chunk in self.stream.iterate_from_chunked_encoding():
+                self._cached_body += chunk
+        else:
+            content_length = int(self.headers.get("Content-Length", 0))
+            self._cached_body = self.stream.read(content_length) if content_length else b""
         return self._cached_body
 
     def to_multipart(self) -> "MultiPart":
@@ -473,18 +477,21 @@ class BufferedSocketReader:
         return data
 
     def iterate_from_chunked_encoding(self, include_encoding: bool = False) -> Iterator[bytes]:
+        rn = b"\r\n"
         while True:
-            raw_length = self.read_to_delimiter(b"\r\n")
+            raw_length = self.read_to_delimiter(rn)
             length = int(raw_length, 16)
-            raw_stream = raw_length + b"\r\n"
+            raw_stream = raw_length + rn
             if length == 0:
-                raw_stream += self.read(len("\r\n"))
+                assert self.read(len(rn)) == rn
+                raw_stream += rn
                 if include_encoding:
                     yield raw_stream
                 break
             chunk = self.read(length)
             raw_stream += chunk
-            raw_stream += self.read(len("\r\n"))
+            assert self.read(len(rn)) == rn
+            raw_stream += rn
             yield raw_stream if include_encoding else chunk
 
     def is_alive(self) -> bool:
