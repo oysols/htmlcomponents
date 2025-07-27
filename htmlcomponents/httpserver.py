@@ -813,7 +813,7 @@ def validate_and_cast_to_type(
         fieldtypes = typing.get_type_hints(data_type)
         return data_type(
             **{key: validate_and_cast_to_type(value, fieldtypes[key], **options) for key, value in data.items()}
-        )  # type: ignore
+        )
     # Generic types
     elif hasattr(data_type, "__origin__"):
         # List[type]
@@ -877,11 +877,11 @@ def request_to_spec(
                 raise Exception(f"Unsupported function argument name: {'_'.join(arg)}")
         try:
             validated_data[name] = validate_and_cast_to_type(value, annotation_type)
-        except Exception:
+        except Exception as e:
             pretty_type_name = (
                 annotation_type.__name__ if hasattr(annotation_type, "__name__") else str(annotation_type)
             )
-            validation_errors.append(f"{name}: expected '{pretty_type_name}'")
+            validation_errors.append(f"{name}: expected '{pretty_type_name}': {e.__class__.__name__}: {e}")
     if validation_errors:
         return None, validation_errors
     return validated_data, []
@@ -897,7 +897,7 @@ def validate_and_call_route_function(
     validated_spec, errors = request_to_spec(request.matched_route, request, annotations)
     if validated_spec is None:
         response: RouteFunctionResponse = Response(
-            b"Request Type Error: " + ", ".join(errors).encode(), 400, {"content-type": "text/plain"}
+            b"Request Type Error: " + ", ".join(errors).encode(), 422, {"content-type": "text/plain"}
         )
     else:
         response = route_function(**validated_spec)
@@ -924,7 +924,7 @@ def cast_request(route_function: Callable[..., RouteFunctionResponse]) -> RouteF
         ...
     ```
     The index function will be called with `header_user_agent = int(request.headers.get("User-Agent"))`
-    This might raise a type error and returns Response<400> to the user.
+    This might raise a type error and returns Response<422> to the user.
     > Request Type Error: header_user_agent: Expected 'int', but got 'Mozilla/5.0...
     """
 
