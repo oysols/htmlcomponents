@@ -1124,7 +1124,8 @@ class ServeStaticPath:
                 startstring, endstring = rangestring.split("-")
                 start = int(startstring)
                 inclusive_end = int(endstring) if endstring else file_size - 1
-                if start < 0 or start >= file_size or inclusive_end < start or inclusive_end >= file_size:
+                # Accept end larger than file size
+                if start < 0 or start >= file_size or inclusive_end < start:
                     raise ValueError("Invalid byte range")
             except Exception as e:
                 return Response(f"Invalid Range request: {e}", 400)
