@@ -110,7 +110,7 @@ def file_content_iterator(
             yield data
 
 
-def match_path(pattern: str, path: str) -> Dict[str, str] | None:
+def match_path(pattern: str, path: str) -> dict[str, str] | None:
     # Returns None if it does not match
     # Returns matching variables if included in pattern
     parsed = {}
@@ -124,6 +124,7 @@ def match_path(pattern: str, path: str) -> Dict[str, str] | None:
     glob = None
     for pattern_part, path_part in zip_longest(regex_parts, path_parts):
         if glob is not None:
+            # TODO: Does not handle "<*glob>/something"
             parsed[glob] += f"/{path_part}"
             continue
         elif pattern_part == path_part:
