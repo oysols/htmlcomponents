@@ -166,9 +166,15 @@ class Headers:
 
     # Replace overloads with TypeVar Defaults in Python 3.13 https://peps.python.org/pep-0696
     def get(self, key: str, default: T = None) -> str | T:  # type: ignore
+        # TODO: Exception if header is duplicated, might not be a good idea
+        result = None
         for k, v in self.raw_headers:
             if k.lower() == key.lower():
-                return v
+                if result is not None:
+                    raise Exception(f"Duplicate header key: {key}")
+                result = v
+        if result is not None:
+            return result
         return default
 
     def set(self, key: str, value: str) -> None:
@@ -177,14 +183,14 @@ class Headers:
         for k, v in self.raw_headers:
             if k.lower() == key.lower():
                 if has_set:
+                    # Do not allow duplicate keys. Not copying existing duplicate.
                     continue
                 new_raw_headers.append((key, value))
                 has_set = True
             else:
                 new_raw_headers.append((k, v))
-        else:
-            if not has_set:
-                new_raw_headers.append((key, value))
+        if not has_set:
+            new_raw_headers.append((key, value))
         self.raw_headers = new_raw_headers
 
     def copy(self) -> Headers:
