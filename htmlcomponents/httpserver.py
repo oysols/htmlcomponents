@@ -1055,7 +1055,12 @@ class ServeStaticPath:
     CHUNK_SIZE = 1024 * 1024
 
     def __init__(
-        self, base_route: str, local_path: Path, guess_content_type: bool = True, cache_control: int | None = None
+        self,
+        base_route: str,
+        local_path: Path,
+        guess_content_type: bool = True,
+        cache_control: int | None = None,
+        directory_listing: bool = False,
     ) -> None:
         self.base_route = base_route.rstrip("/") + "/<*path>"
         self.resolved_local_path = local_path.resolve()
@@ -1063,6 +1068,7 @@ class ServeStaticPath:
         self.cache_control = cache_control
         if not self.resolved_local_path.is_dir():
             raise Exception("Expected directory")
+        self.directory_listing = directory_listing
 
     def __call__(self, request: Request) -> Response | None:
         # Check if we match route
@@ -1074,6 +1080,25 @@ class ServeStaticPath:
         local_path = (self.resolved_local_path / Path(path)).resolve()
         # Assert that file is child of local_path
         assert local_path.relative_to(self.resolved_local_path)
+        # Directory listing
+        if self.directory_listing:
+            # Check if it is directory
+            if local_path.is_dir():
+                index = local_path / "index.html"
+                if index.is_file():
+                    # Show index instead
+                    local_path = index
+                else:
+                    out = f"<head><title>{Path(request.path).name}</title></head><body>\n"
+                    for p in sorted(local_path.iterdir()):
+                        name = p.name
+                        href = str(Path(request.path) / p.name)
+                        if p.is_dir():
+                            name += "/"
+                            href += "/"
+                        out += f'<a href="{href}">{name}</a><br/>\n'
+                    out += "</body>"
+                    return Response(out, 200, {"content-type": "text/html"})
         # Check that file exists
         if not local_path.is_file():
             return Response("Page not found", 404)
