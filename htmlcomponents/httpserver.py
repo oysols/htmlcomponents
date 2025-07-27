@@ -205,12 +205,13 @@ class Request:
     remote_addr: str
     method: Method
     path: str
-    query_params: Dict[str, str]
+    query_params: dict[str, str]
     headers: Headers
     stream: BufferedSocketReader
     request_start: float
     matched_route: str | None
-    matched_route_mapping: Dict[str, str] | None
+    matched_route_mapping: dict[str, str] | None
+    log: Callable[..., None] = print
     _cached_body: bytes | None = None
 
     def __repr__(self) -> str:
@@ -239,7 +240,11 @@ class Request:
 
     @staticmethod
     def from_raw(
-        remote_addr: str, header: bytes, buf_sock_reader: BufferedSocketReader, read_x_forwarded_for: bool = False
+        remote_addr: str,
+        header: bytes,
+        buf_sock_reader: BufferedSocketReader,
+        read_x_forwarded_for: bool = False,
+        log: Callable[..., None] = print,
     ) -> Request:
         http_code_header, *http_headers = header.decode().split("\r\n")
         raw_method, url, _protocol = http_code_header.split()
@@ -248,7 +253,7 @@ class Request:
         query_params = dict(urllib.parse.parse_qsl(query_string[0], keep_blank_values=True)) if query_string else {}
         headers = Headers.from_raw(http_headers)
         return Request(
-            headers.get("X-Forwarded-For") or remote_addr,  # TODO: Security
+            remote_addr,
             method,
             path,
             query_params,
@@ -256,6 +261,8 @@ class Request:
             buf_sock_reader,
             time.time(),
             None,
+            None,
+            log,
             None,
         )
 
