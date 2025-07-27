@@ -29,13 +29,10 @@ from types import FrameType, UnionType
 from typing import (
     Any,
     Callable,
-    Dict,
     Iterable,
     Iterator,
-    List,
     Protocol,
     Sequence,
-    Tuple,
     Type,
     TypeVar,
     Union,
@@ -260,7 +257,7 @@ class Request:
     def to_multipart(self) -> "MultiPart":
         return MultiPart.from_request(self)
 
-    def get_session(self) -> Dict[Any, Any]:
+    def get_session(self) -> dict[Any, Any]:
         # Parse session cookie
         # https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Cookie
         # Cookie: name=value; name2=value2; name3=value3
@@ -275,10 +272,10 @@ class Request:
                 pass
         return session
 
-    def form_data(self) -> Dict[str, str]:
+    def form_data(self) -> dict[str, str]:
         return dict(urllib.parse.parse_qsl(self.body().decode(), keep_blank_values=True))
 
-    def json(self) -> Dict[str, Any]:
+    def json(self) -> dict[str, Any]:
         return json.loads(self.body().decode())  # type: ignore
 
     def print(self) -> None:
@@ -300,8 +297,8 @@ class Response:
         self,
         body: BodyResponse,
         code: int = 200,
-        headers: Dict[str, str] | None = None,
-        set_session: Dict[str, str] | None = None,
+        headers: dict[str, str] | None = None,
+        set_session: dict[str, str] | None = None,
         raw_headers: Headers | None = None,
     ) -> None:
         if raw_headers:
@@ -332,7 +329,7 @@ class Response:
                 self.headers.set(k, v)
 
     @staticmethod
-    def cast_body_response(body: BodyResponse) -> Tuple[bytes | Iterator[bytes], str]:
+    def cast_body_response(body: BodyResponse) -> tuple[bytes | Iterator[bytes], str]:
         # Returns bytes and guesses content type
         if isinstance(body, Iterator):
             return body, ContentType.text_plain
@@ -354,7 +351,7 @@ class Response:
         raise TypeError(f"Unsupported cast from {type(body).__name__} to bytes.")
 
 
-BodyResponse = bytes | str | Dict[str, Any] | HTMLRenderable | Sequence[HTMLRenderable] | Iterator[bytes]
+BodyResponse = bytes | str | dict[str, Any] | HTMLRenderable | Sequence[HTMLRenderable] | Iterator[bytes]
 RouteFunctionResponse = Response | BodyResponse
 RouteFunction = Callable[[Request], RouteFunctionResponse] | Callable[[], RouteFunctionResponse]
 
@@ -852,10 +849,10 @@ def validate_and_cast_to_type(
 
 
 def request_to_spec(
-    path_regex: str | None, request: Request, spec: Dict[str, Type[T]]
-) -> Tuple[Dict[str, T] | None, List[str]]:
+    path_regex: str | None, request: Request, spec: dict[str, Type[T]]
+) -> tuple[dict[str, T] | None, list[str]]:
     validated_data = {}
-    validation_errors: List[str] = []
+    validation_errors: list[str] = []
     for name, annotation_type in spec.items():
         value: Any
         match name.split("_", maxsplit=1):
@@ -1007,7 +1004,7 @@ class App:
 
 
 class Router:
-    routes: List[Tuple[str, str, RouteFunction]]
+    routes: list[tuple[str, str, RouteFunction]]
 
     def __init__(self) -> None:
         self.routes = []
@@ -1022,7 +1019,7 @@ class Router:
     get = functools.partialmethod(add_route, method=Method.get)
     post = functools.partialmethod(add_route, method=Method.post)
 
-    def _get_route(self, method: str, path: str) -> Tuple[str, Dict[str, str], RouteFunction] | None:
+    def _get_route(self, method: str, path: str) -> tuple[str, dict[str, str], RouteFunction] | None:
         for route_method, pattern, route_function in self.routes:
             if route_method != method:
                 continue
