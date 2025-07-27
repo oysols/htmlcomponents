@@ -218,27 +218,6 @@ class Request:
         return f"Request<{self.method.value} {self.path}>"
 
     @staticmethod
-    def from_wsgi(environ: Dict[str, Any]) -> "Request":
-        method = Method(environ["REQUEST_METHOD"])
-        path = environ["PATH_INFO"]
-        query_params = dict(urllib.parse.parse_qsl(environ["QUERY_STRING"]))
-        # WSGI request headers are prefixed with HTTP_
-        raw_headers = [(k[5:].replace("_", "-"), v) for k, v in environ.items() if k.startswith("HTTP_")]
-        headers = Headers(raw_headers)
-        remote_addr = environ["REMOTE_ADDR"]
-        return Request(
-            remote_addr,
-            method,
-            path,
-            query_params,
-            headers,
-            environ["wsgi.input"],  # Not correct type, but does support `.read`
-            time.time(),
-            None,
-            None,
-        )
-
-    @staticmethod
     def from_raw(
         remote_addr: str,
         header: bytes,
@@ -739,10 +718,27 @@ class WSGIWrapper:
 
     def __call__(
         self,
-        environ: Dict[str, Any],  # wsgiref.types.WSGIEnvironment
-        start_response: Callable[[str, List[Tuple[str, str]]], Callable[..., Any]],  # wsgiref.types.StartResponse,
+        environ: dict[str, Any],  # wsgiref.types.WSGIEnvironment
+        start_response: Callable[[str, list[tuple[str, str]]], Callable[..., Any]],  # wsgiref.types.StartResponse,
     ) -> Iterable[bytes]:
-        request = Request.from_wsgi(environ)
+        method = Method(environ["REQUEST_METHOD"])
+        path = environ["PATH_INFO"]
+        query_params = dict(urllib.parse.parse_qsl(environ["QUERY_STRING"]))
+        # WSGI request headers are prefixed with HTTP_
+        raw_headers = [(k[5:].replace("_", "-"), v) for k, v in environ.items() if k.startswith("HTTP_")]
+        headers = Headers(raw_headers)
+        remote_addr = environ["REMOTE_ADDR"]
+        request = Request(
+            remote_addr,
+            method,
+            path,
+            query_params,
+            headers,
+            environ["wsgi.input"],  # Not correct type, but does support `.read`
+            time.time(),
+            None,
+            None,
+        )
 
         response = self.request_handler(request)
         if response is None:
