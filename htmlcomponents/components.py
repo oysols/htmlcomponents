@@ -2,9 +2,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from html import escape
-from typing import Dict, List, Self, Union
+from typing import Self, Union
 
-Node = Union["Component", str, None, list["Node"]]
+Node = Union["Component", str, "NoEscape", None, list["Node"]]
 
 
 @dataclass
@@ -33,18 +33,19 @@ class Component:
     """
 
     children: list[Node]
-    style: Dict[str, str]
-    attrs: Dict[str, str | None]
+    attrs: dict[str, str | None]
+    style: dict[str, str]
 
     def __init__(
         self,
         *children: Component | str | None,
-        style: Dict[str, str] = {},
+        style: dict[str, str] = {},
         **attrs: str | None,
     ) -> None:
         self.children = list(children)
         self.attrs = attrs.copy()
         self.style = style.copy()
+        self.tag = self.__class__.__name__.replace("_", "-")
 
     def __call__(self, *children: Node) -> Self:
         if self.children:
@@ -76,24 +77,23 @@ class Component:
             f'{escape(key)}="{escape(value)}"' if value is not None else f"{escape(key)}"
             for key, value in attrs.items()
         )
-        name = self.__class__.__name__.replace("_", "-")
-        first_line = " " * indent + f"<{name}{' ' + attrs_string if attrs_string else ''}>"
+        first_line = " " * indent + f"<{self.tag}{' ' + attrs_string if attrs_string else ''}>"
         # Void element
         if isinstance(self, VoidComponent):
             return [first_line]
         # Inline empty
         if not self.children:
-            return [first_line + f"</{name}>"]
+            return [first_line + f"</{self.tag}>"]
         # Inline single string children
         if len(self.children) == 1 and isinstance(self.children[0], str) and not isinstance(self.children[0], NoEscape):
-            return [first_line + escape(self.children[0]) + f"</{name}>"]
+            return [first_line + escape(self.children[0]) + f"</{self.tag}>"]
         lines = [first_line]
         lines += render_node(self.children, indent + 2)
-        lines += [" " * indent + f"</{name}>"]
+        lines += [" " * indent + f"</{self.tag}>"]
         return lines
 
 
-def render_node(node: Node, indent: int = 0) -> List[str]:
+def render_node(node: Node, indent: int = 0) -> list[str]:
     if isinstance(node, list):
         lines = []
         for sub_node in node:
@@ -112,6 +112,8 @@ def render_node(node: Node, indent: int = 0) -> List[str]:
 
 
 class NoEscape(str):
+    """Wrapper to bypass escaping during HTML rendering"""
+
     pass
 
 
@@ -158,6 +160,7 @@ class html:
     class button(Component): pass
     class canvas(Component): pass
     class caption(Component): pass
+    class center(Component): pass
     class cite(Component): pass
     class code(Component): pass
     class colgroup(Component): pass
@@ -247,7 +250,7 @@ class html:
 
     # Custom handling for special doctype component
     class doctype(Component):
-        def render_component(self, indent: int = 0) -> List[str]:
+        def render_component(self, indent: int = 0) -> list[str]:
             return ["<!DOCTYPE html>"] + render_node(self.children, indent)
 
     # Svg subset
@@ -261,16 +264,20 @@ class html:
 # fmt: on
 
 
-def html_doc_template(*body: Component | str | None) -> Component:
+def html_doc_template(*body: Component | str | None, title: str = "", head: list[Component] = []) -> Component:
     """Simple html document example"""
     return html.doctype(
         html.html(lang="en")(
             html.head(
-                html.title(),
+                html.title(title),
                 html.meta(charset="utf-8"),
+                # Make it look correct on mobile / small screens
                 html.meta(name="viewport", content="width=device-width, initial-scale=1.0"),
+                # Stop the browser from fetching /favicon.ico
                 html.link(rel="icon", href="noop://"),
+                # Reset CSS
                 html.style("*{box-sizing: border-box;} body{margin: 0; padding: 0;} h1,h2,h3,h4,h5,h6{margin-top:0}"),
+                *head,
             ),
             html.body(*body),
         )
