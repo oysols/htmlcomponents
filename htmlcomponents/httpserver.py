@@ -1062,7 +1062,7 @@ def cast_request(route_function: Callable[..., RouteFunctionResponse]) -> RouteF
 def main() -> None:
     """usage: `httpserver [PORT]`"""
     port = int(sys.argv[1]) if len(sys.argv) == 2 else 8000
-    http_server(ServeStaticPath("", Path(".")), port=port, read_x_forwarded_for=True)
+    http_server(ServeStaticPath("", Path("."), directory_listing=True), port=port, read_x_forwarded_for=True)
 
 
 def proxy_request(request: Request, host: str, port: int) -> Response:
