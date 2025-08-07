@@ -1327,10 +1327,6 @@ class ServeStaticPath:
         )
 
 
-def proxy_fix(request: Request) -> None:
-    request.remote_addr = request.headers.get("X-Forwarded-For") or request.remote_addr
-
-
 def gzip_response(request: Request, response: Response) -> Response:
     if (
         isinstance(response.body, bytes)
