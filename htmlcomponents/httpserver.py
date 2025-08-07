@@ -549,115 +549,199 @@ class WrappedSSLSocket(ssl.SSLSocket):
     intercepted_sni_hostname: str | None = None
 
 
-def connection_handler(
-    conn: socket.socket | WrappedSSLSocket,
-    client_address: tuple[str, str],
-    handler: RequestHandler,
-    keep_alive: bool,
-    use_tls: bool,
-    read_x_forwarded_for: bool,
-    debug: bool = False,
-) -> None:
-    connection_start = time.time()
-    debug_address_prefix = f"{client_address[0]}:{client_address[1]}"
-    reason_for_close = None
-    if debug:
-        print(f"{debug_address_prefix} Connection opened")
+class ReentrantSemaphore:
+    def __init__(self, semaphore: threading.BoundedSemaphore) -> None:
+        self.semaphore = semaphore
+        self.lock = threading.Lock()
+        self.is_aquired = False
+
+    def acquire(self) -> None:
+        with self.lock:
+            if not self.is_aquired:
+                self.semaphore.acquire()
+                self.is_aquired = True
+
+    def maybe_acquire(self, timeout: int) -> bool:
+        with self.lock:
+            if self.is_aquired:
+                return True
+            if self.semaphore.acquire(timeout=timeout):
+                self.is_aquired = True
+                return True
+        return False
+
+    def release(self) -> None:
+        with self.lock:
+            if self.is_aquired:
+                self.semaphore.release()
+                self.is_aquired = False
+
+
+def hash_to_ansi_color(s: str, minimum: int = 70) -> str:
+    return "\033[38;2;{};{};{}m".format(*[i % (256 - minimum) + minimum for i in hashlib.md5(s.encode()).digest()[:3]])
+
+
+@dataclass
+class ConnectionContext:
+    conn: socket.socket | WrappedSSLSocket
+    socket_reader: BufferedSocketReader
+    client_address: tuple[str, int]
+    keep_alive: int | None
+    use_tls: bool
+    read_x_forwarded_for: bool
+    debug: bool
+    connection_semaphore: ReentrantSemaphore
+    worker_semaphore: ReentrantSemaphore
+
+    def log(self, *args: Any, x_forwarded_for: str | None = None) -> None:
+        # TODO: Use hash as tracing to correlate proxy and service (Trace-Id: hash1[hash2][hash3])
+        h = hashlib.md5(str(self.client_address[1]).encode()).hexdigest()
+        color = hash_to_ansi_color(h) if self.debug else ""
+        client = x_forwarded_for if self.read_x_forwarded_for and x_forwarded_for else self.client_address[0]
+        w_semaphores = f"{self.worker_semaphore.semaphore._initial_value - self.worker_semaphore.semaphore._value}"  # type: ignore
+        c_semaphores = (
+            f"{self.connection_semaphore.semaphore._initial_value - self.connection_semaphore.semaphore._value}"  # type: ignore
+        )
+        endcolor = "\033[0m" if self.debug else ""
+        print(
+            f"{color}{datetime.datetime.now()} {client} {w_semaphores}|{c_semaphores} {' '.join([str(a) for a in args])}{endcolor}"
+        )
+
+
+def http_handler(context: ConnectionContext, handler: RequestHandler) -> None:
+    handler_start = time.time()
+    header = context.socket_reader.read_to_delimiter(b"\r\n\r\n")
+    request = Request.from_raw(
+        context.client_address[0], header, context.socket_reader, context.read_x_forwarded_for, log=context.log
+    )
+
+    # Validate that Host matches SNI
+    if context.use_tls:
+        assert isinstance(context.conn, WrappedSSLSocket)
+        if request.headers.get("Host") != context.conn.intercepted_sni_hostname:
+            raise ssl.SSLError(
+                f"Host header does not match SNI {request.headers.get('Host')} != {context.conn.intercepted_sni_hostname}"
+            )
+
+    # Call request handler
     try:
+        response = handler(request)
+        if response is None:
+            response = Response("Page not found", 404)
+    except Exception:
+        traceback.print_exc()
+        response = Response("Internal Server Error", 500)
+    request_handler_duration = time.time() - request.request_start
+    context.worker_semaphore.release()
+
+    # Send headers
+    response.headers.set("Server", "httpserver.py")
+    if response.headers.get("Connection") is None and context.keep_alive is None:
+        response.headers.set("Connection", "close")
+
+    phrase, _ = http.server.BaseHTTPRequestHandler.responses[response.code]
+    http_header = [
+        f"HTTP/1.1 {response.code} {phrase}\r\n".encode(),
+        b"\r\n".join([f"{k}: {v}".encode() for k, v in response.headers.raw_headers]),
+        b"\r\n\r\n",
+    ]
+    context.conn.sendall(b"".join(http_header))
+
+    if context.debug and not isinstance(response.body, bytes):
+        context.log(
+            request.headers.get("Host"),
+            response.code,
+            request.method.value,
+            request.path,
+            f"{request_handler_duration * 1000:.2f}ms",
+            "Streaming response",
+            x_forwarded_for=request.headers.get("X-Forwarded-For", "").split(",")[0],
+        )
+
+    # Send body
+    transfered_bytes = 0
+    body_iterable = iter([response.body]) if isinstance(response.body, bytes) else response.body
+    transfer_exception = None
+    try:
+        for chunk in body_iterable:
+            transfered_bytes += len(chunk)
+            if chunk == b"" and not context.socket_reader.is_alive():
+                # Endpoint can yield b"" to verify connection status
+                break
+            context.conn.sendall(chunk)
+    except Exception as e:
+        transfer_exception = e
+        raise
+    finally:
+        # Request logging
+        total_duration = time.time() - handler_start
+        context.log(
+            request.headers.get("Host"),
+            response.code,
+            request.method.value,
+            request.path,
+            f"{request_handler_duration * 1000:.2f}ms",
+            f"{transfered_bytes / 1000:.3f}kB",
+            f"{total_duration * 1000:.2f}ms",
+            (f"{type(transfer_exception).__name__}: {transfer_exception}" if transfer_exception is not None else ""),
+            x_forwarded_for=request.headers.get("X-Forwarded-For", "").split(",")[0],
+        )
+
+
+def connection_handler(context: ConnectionContext, handler: RequestHandler) -> None:
+    connection_start = time.time()
+    reason_for_close = None
+    context.worker_semaphore.acquire()
+    try:
+        if context.debug:
+            context.log("Connection opened")
         # Perform SSL handshake inside thread to avoid blocking main loop
-        if use_tls:
-            assert isinstance(conn, WrappedSSLSocket)
-            conn.settimeout(5)
-            conn.do_handshake()
-            if debug:
-                print(f"{debug_address_prefix} Connection TLS handshake {(time.time() - connection_start)*1000:.2f}ms")
-
-        socket_reader = BufferedSocketReader(conn)
+        if context.use_tls:
+            assert isinstance(context.conn, WrappedSSLSocket)
+            context.conn.settimeout(5)
+            # TODO: INFO Sometimes hangs when a lot of connections are aborted from client ('hey' does this)
+            try:
+                context.conn.do_handshake()
+            except ssl.SSLZeroReturnError:
+                raise ConnectionResetError("SSL handshake closed by client")
+            if context.debug:
+                context.log(f"Connection TLS handshake {(time.time() - connection_start) * 1000:.2f}ms")
         while True:  # Reuse connection if keep alive is set
-            request_start = time.time()
-            header = socket_reader.read_to_delimiter(b"\r\n\r\n")
-            request = Request.from_raw(client_address[0], header, socket_reader, read_x_forwarded_for)
-
-            # Validate that Host matches SNI
-            if use_tls:
-                assert isinstance(conn, WrappedSSLSocket)
-                host, *port = request.headers.get("Host", "").split(":")
-                if port:
-                    assert len(port) == 1
-                    assert int(port[0]) > 0
-                    assert int(port[0]) <= 65535
-                if host != conn.intercepted_sni_hostname:
-                    raise ssl.SSLError(
-                        f"Host header does not match SNI {request.headers.get('Host')} != {conn.intercepted_sni_hostname}"
-                    )
-
-            # Call request handler
-            try:
-                response = handler(request)
-                if response is None:
-                    response = Response("Page not found", 404)
-            except Exception:
-                traceback.print_exc()
-                response = Response("Internal Server Error", 500)
-            request_handler_duration = time.time() - request.request_start
-
-            # Send headers
-            response.headers.set("Server", "httpserver.py")
-            response.headers.set("Connection", "keep-alive" if keep_alive else "close")
-            phrase, _ = http.server.BaseHTTPRequestHandler.responses[response.code]
-            conn.sendall(f"HTTP/1.1 {response.code} {phrase}\r\n".encode())
-            conn.sendall(b"\r\n".join([f"{k}: {v}".encode() for k, v in response.headers.raw_headers]))
-            conn.sendall(b"\r\n\r\n")
-
-            # Send body
-            transfered_bytes = 0
-            body_iterable = iter([response.body]) if isinstance(response.body, bytes) else response.body
-            transfer_exception = None
-            try:
-                for chunk in body_iterable:
-                    transfered_bytes += len(chunk)
-                    if chunk == b"" and not socket_reader.is_alive():
-                        # Endpoint can yield b"" to verify connection status
-                        break
-                    conn.sendall(chunk)
-            except Exception as e:
-                transfer_exception = e
-                raise
-            finally:
-                # Request logging
-                total_duration = time.time() - request_start
-                x_forwarded_for = request.headers.get("X-Forwarded-For", "").split(",")[0]
-                log_client_address = x_forwarded_for if x_forwarded_for and read_x_forwarded_for else client_address[0]
-                print(
-                    log_client_address if not debug else f"{debug_address_prefix} {log_client_address}",
-                    request.headers.get("Host"),
-                    response.code,
-                    request.method.value,
-                    request.path,
-                    f"{request_handler_duration * 1000:.2f}ms",
-                    f"{transfered_bytes / 1000:.3f}kB",
-                    f"{total_duration * 1000:.2f}ms",
-                    (
-                        f"{type(transfer_exception).__name__}: {transfer_exception}"
-                        if transfer_exception is not None
-                        else ""
-                    ),
-                )
-            if not keep_alive:
+            http_handler(context, handler)
+            if not context.keep_alive:
                 reason_for_close = "No keep alive"
                 break
-    except (ConnectionResetError, TimeoutError, BrokenPipeError, ssl.SSLError) as e:
+            else:
+                if context.debug:
+                    context.log("Keep Alive: Idling")
+                context.socket_reader.set_timeout(context.keep_alive)
+                context.socket_reader._recv_to_buf(1)  # Keep Alive
+
+                context.worker_semaphore.acquire()
+                if context.debug:
+                    context.log("Keep Alive: Restoring")
+    except (ConnectionResetError, TimeoutError, BrokenPipeError, ssl.SSLError, ProtocolError) as e:
         reason_for_close = f"{type(e).__name__}: {e}"
+        # TODO: Log unexpected closures in both debug and normal mode
     except Exception as e:
         reason_for_close = f"Unhandled Exception: {e}"
         traceback.print_exc()
     finally:
-        if debug:
-            print(
-                f"{debug_address_prefix} Connection closed {(time.time() - connection_start)*1000:.2f}ms: {reason_for_close}"
-            )
-        conn.shutdown(socket.SHUT_RDWR)
-        conn.close()
+        try:
+            context.worker_semaphore.release()
+            # https://apenwarr.ca/log/20090814
+            # If we call .close directly we will send RST to client, potentially breaking data stream
+            # Close the socket for writing (send FIN to client)
+            context.conn.settimeout(5)
+            context.conn.shutdown(socket.SHUT_WR)
+            # Try to drain the read queue, but give up after some amount of bytes.
+            context.conn.recv(10 * 1024)  # Drain the read queue
+            # We now know the client has closed the connection, and can gracefully close our own
+        finally:
+            context.connection_semaphore.release()
+            if context.debug:
+                context.log(f"Connection closed {(time.time() - connection_start) * 1000:.2f}ms: {reason_for_close}")
+            context.conn.close()
 
 
 class SignalHandler:
@@ -678,8 +762,9 @@ def http_server(
     handler: RequestHandler,
     host: str = "0.0.0.0",
     port: int = 8000,
-    threads: int = 20,
-    keep_alive: bool = False,
+    connection_threads: int = 400,
+    workers: int = 100,
+    keep_alive: int | None = None,
     use_tls: bool = False,
     tls_crt: Path | None = None,
     tls_key: Path | None = None,
@@ -687,6 +772,8 @@ def http_server(
     share_socket: bool = False,
     debug: bool = False,
 ) -> None:
+    connection_semaphore = threading.BoundedSemaphore(connection_threads)
+    worker_semaphore = threading.BoundedSemaphore(workers)
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     if share_socket:
         # SO_REUSEPORT allows multiple processes to listen on same port
@@ -710,24 +797,37 @@ def http_server(
         ssl_context.load_cert_chain(tls_crt, tls_key)
         # Wrap to store SNI for validation
         ssl_context.sslsocket_class = WrappedSSLSocket
-        ssl_context.sni_callback = sni_callback  # type: ignore
+        ssl_context.set_servername_callback(sni_callback)  # type: ignore
         maybe_ssl = ssl_context.wrap_socket(sock, server_side=True, do_handshake_on_connect=False)
-    print(f"socketserver listening on {host}:{port}")
+    print(f"httpserver listening on {'https' if use_tls else 'http'}://{host}:{port}")
+    print(
+        f"workers/connections:{workers}/{connection_threads} x-forwarded-for:{read_x_forwarded_for} keepalive:{keep_alive} share_socket:{share_socket} debug:{debug}"
+    )
+
     with maybe_ssl as sock:
-        max_queue = 100
         # Connection thread pool
-        with concurrent.futures.ThreadPoolExecutor(threads) as e:
+        with concurrent.futures.ThreadPoolExecutor(connection_threads) as e:
+            reentrant_connection_semaphore = ReentrantSemaphore(connection_semaphore)
             while True:
                 if signal_handler.sigterm:
                     print("Received SIGTERM. Gracefully shutting down.")
                     break
-                if e._work_queue.qsize() > max_queue:
-                    print(f"Warn: All threads busy. Queue of {e._work_queue.qsize()}")
-                    while e._work_queue.qsize() > max_queue:
-                        time.sleep(0.001)
-                    print("Threads available")
+                if not reentrant_connection_semaphore.maybe_acquire(timeout=1):
+                    continue
                 try:
                     conn, client_address = sock.accept()
+                    context = ConnectionContext(
+                        conn,
+                        BufferedSocketReader(conn),
+                        client_address,
+                        keep_alive,
+                        use_tls,
+                        read_x_forwarded_for,
+                        debug,
+                        reentrant_connection_semaphore,
+                        ReentrantSemaphore(worker_semaphore),
+                    )
+                    e.submit(connection_handler, context, handler)
                 except TimeoutError:
                     continue
                 except Exception as exception:
@@ -736,9 +836,7 @@ def http_server(
                     print(f"Error during accept() in main thread: {exception}")
                     traceback.print_exc()
                     continue
-                e.submit(
-                    connection_handler, conn, client_address, handler, keep_alive, use_tls, read_x_forwarded_for, debug
-                )
+                reentrant_connection_semaphore = ReentrantSemaphore(connection_semaphore)
 
 
 class WSGIWrapper:
