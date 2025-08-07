@@ -1171,7 +1171,11 @@ class App:
 
     def __call__(self, request: Request) -> Response:
         for handler in self.request_handlers:
-            app_response = handler(request)
+            try:
+                app_response = handler(request)
+            except Exception:
+                traceback.print_exc()
+                app_response = Response("Internal Server Error", 500)
             if app_response is not None:
                 break
         else:
