@@ -54,8 +54,11 @@ class HTMLRenderable(Protocol):
 class ContentType:
     text_html = "text/html"
     text_plain = "text/plain"
+    text_javascript = "application/javascript"
     octet_stream = "application/octet-stream"
     application_json = "application/json"
+    image_jpeg = "image/jpeg"
+    image_png = "image/png"
 
 
 class Method(str, enum.Enum):
