@@ -107,6 +107,10 @@ def file_content_iterator(
             yield data
 
 
+class ProtocolError(Exception):
+    pass
+
+
 def match_path(pattern: str, path: str) -> dict[str, str] | None:
     # Returns None if it does not match
     # Returns matching variables if included in pattern
@@ -223,7 +227,9 @@ class Request:
         log: Callable[..., None] = print,
     ) -> Request:
         http_code_header, *http_headers = header.decode().split("\r\n")
-        raw_method, url, _protocol = http_code_header.split()
+        raw_method, url, protocol = http_code_header.split()
+        if protocol not in ["HTTP/1.0", "HTTP/1.1"]:
+            raise ProtocolError(f"Unsupported protocol {protocol}")
         method = Method(raw_method)
         path, *query_string = url.split("?", 1)
         query_params = dict(urllib.parse.parse_qsl(query_string[0], keep_blank_values=True)) if query_string else {}
