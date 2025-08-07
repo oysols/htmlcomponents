@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import base64
 import binascii
 import concurrent.futures
 import contextlib
 import dataclasses
+import datetime
 import enum
 import functools
 import gzip
@@ -13,11 +15,13 @@ import http.server
 import json
 import mimetypes
 import secrets
+import select
 import signal
 import socket
 import ssl
 import sys
 import textwrap
+import threading
 import time
 import traceback
 import typing
@@ -197,6 +201,13 @@ class Headers:
             new_raw_headers.append((key, value))
         self.raw_headers = new_raw_headers
 
+    def remove(self, key: str) -> None:
+        new_raw_headers = []
+        for k, v in self.raw_headers:
+            if k.lower() != key.lower():
+                new_raw_headers.append((k, v))
+        self.raw_headers = new_raw_headers
+
     def copy(self) -> Headers:
         return Headers(self.raw_headers.copy())
 
@@ -324,6 +335,8 @@ class Response:
         self.headers.set("Content-Type", content_type)
         if isinstance(self.body, bytes):
             self.headers.set("Content-Length", str(len(self.body)))
+        # TODO: Alternative interface to session/cookies: Make it composeable. Might simplify response generation.
+        # return Response("hello", 200, {"some_header": 1, **set_cookie(data, name="session", max_age=0, secure=False)})
         if set_session is not None:
             serialized_data = serialize_with_hmac(COOKIE_HMAC_SECRET, set_session)
             if set_session == {}:
@@ -378,6 +391,11 @@ class MultiPartSubPart:
 
 @dataclass
 class MultiPart:
+    """Read multipart form data from incoming request
+    for part in request.to_multipart():
+        data[part.form_name] = part.data()
+    """
+
     buffered_reader: BufferedSocketReader
     delimiter: bytes
     content_length: int
