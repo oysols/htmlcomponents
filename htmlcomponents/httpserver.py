@@ -249,7 +249,7 @@ class Request:
         query_params = dict(urllib.parse.parse_qsl(query_string[0], keep_blank_values=True)) if query_string else {}
         headers = Headers.from_raw(http_headers)
         return Request(
-            remote_addr,
+            headers.get("X-Forwarded-For") or remote_addr if read_x_forwarded_for else remote_addr,
             method,
             path,
             query_params,
