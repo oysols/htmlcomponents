@@ -3,7 +3,10 @@ name = "htmlcomponents"
 version = "0.1.0"
 description = ""
 dependencies = []
-optional-dependencies.dev = [
+requires-python=">=3.10"
+
+[dependency-groups]
+dev = [
     "mypy",
     "ruff",
 ]
@@ -13,6 +16,9 @@ httpserver = "htmlcomponents:httpserver.main"
 
 [tool.ruff]
 line-length = 120
+
+[tool.ruff.lint]
+extend-select = ["I"]
 
 [build-system]
 requires = ["hatchling"]
