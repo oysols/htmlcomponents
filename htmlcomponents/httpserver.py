@@ -1065,6 +1065,27 @@ def main() -> None:
     http_server(ServeStaticPath("", Path("."), directory_listing=True), port=port, read_x_forwarded_for=True)
 
 
+def proxy_raw_sockets(
+    client: socket.socket, server: socket.socket, bufsize: int = 1024 * 16, timeout: float = 60
+) -> Iterator[bytes]:
+    # Raise exception to make sure connection is dropped at end of proxy to avoid security issues
+    yield b""  # noop to make it an iterator
+    while True:
+        r, _, _ = select.select([client, server], [], [], timeout)
+        if client in r:
+            data = client.recv(bufsize)
+            if data == b"":
+                raise ConnectionResetError("Bidirectional raw stream closed by client")
+            server.sendall(data)
+        if server in r:
+            data = server.recv(bufsize)
+            if data == b"":
+                raise ConnectionResetError("Bidirectional raw stream closed by server")
+            client.sendall(data)
+        if r == []:
+            raise TimeoutError("Bidirectional raw stream timed out")
+
+
 def proxy_request(request: Request, host: str, port: int) -> Response:
     # Connect to proxied host
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -1077,6 +1098,20 @@ def proxy_request(request: Request, host: str, port: int) -> Response:
     headers = request.headers.copy()
     headers.set("X-Forwarded-For", request.remote_addr)
 
+    # TODO: Strip hop-by-hop headers
+    # https://datatracker.ietf.org/doc/html/rfc2616#section-13.5.1
+    _PROXY_HOP_BY_HOP_HEADERS = [
+        "Connection",
+        "Keep-Alive",
+        "Proxy-Authenticate",
+        "Proxy-Authorization",
+        "TE",
+        "Trailers",
+        "Transfer-Encoding",
+        "Upgrade",
+    ]
+    headers.remove("Connection")
+
     # Reassemble request HTTP headers
     params = "&".join(
         [urllib.parse.quote(k) + ("=" + urllib.parse.quote(v) if v else "") for k, v in request.query_params.items()]
@@ -1088,7 +1123,7 @@ def proxy_request(request: Request, host: str, port: int) -> Response:
 
     # Proxy the request
     s.sendall(data.encode())
-    if "chunked" in headers.get("Transfer-Encoding", ""):
+    if "chunked" in request.headers.get("Transfer-Encoding", ""):
         for chunk in request.stream.iterate_from_chunked_encoding(include_encoding=True):
             s.sendall(chunk)
     else:
@@ -1101,6 +1136,24 @@ def proxy_request(request: Request, host: str, port: int) -> Response:
     http_top_header, *http_headers = header.decode().split("\r\n")
     _protocol, code, *_description = http_top_header.split()
     headers = Headers.from_raw(http_headers)
+
+    # Hacky web sockets upgrade connection
+    if (
+        headers.get("Connection", "").lower() == "upgrade"
+        and headers.get("Upgrade", "").lower() == "websocket"
+        and int(code) == 101
+    ):
+        # Verify websocket handshake
+        client_ws_key = request.headers.get("Sec-WebSocket-Key", "")
+        key = client_ws_key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+        resp_key = base64.standard_b64encode(hashlib.sha1(key.encode()).digest()).decode()
+        if headers.get("Sec-WebSocket-Accept") != resp_key:
+            return Response("Websocket Proxy Error", 400)
+        # Proxy the raw sockets
+        return Response(proxy_raw_sockets(request.stream.conn, socket_reader.conn), 101, raw_headers=headers)
+
+    # TODO: Strip hop-by-hop headers
+    headers.remove("Connection")
 
     # Proxy body response
     if "chunked" in headers.get("Transfer-Encoding", ""):
